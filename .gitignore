@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+/.test-work/
+/essai.mp4
+*_frames/
+*_frames_[0-9]*/
+/tools/ffmpeg/bin/
+/tools/link-import/
+
+# Configuration locale
+.env
+.env.*
+!.env.example
