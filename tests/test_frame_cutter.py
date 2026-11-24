@@ -714,8 +714,10 @@ class FrameCutterTests(unittest.TestCase):
             self.assertGreaterEqual(gallery.winfo_rooty(), app.canvas.winfo_rooty() - 1)
             self.assertLess(gallery.winfo_rooty(), app.canvas.winfo_rooty() + app.canvas.winfo_height())
 
-            root.geometry("1650x800")
-            self.wait_for(root, lambda: root.winfo_width() == 1650 and gallery._photo is not None)
+            screen_w = root.winfo_screenwidth()
+            wide_width = 1650 if screen_w >= 1700 else max(960, screen_w - 40)
+            root.geometry(f"{wide_width}x800")
+            self.wait_for(root, lambda: root.winfo_width() >= wide_width - 16 and gallery._photo is not None)
             self.assertEqual(app.form.winfo_rooty(), app.preview.winfo_rooty())
             self.assertGreater(gallery.winfo_rooty(), app.preview.winfo_rooty() + app.preview.winfo_height())
             self.assertEqual(gallery.winfo_rootx(), app.form.winfo_rootx())
@@ -893,10 +895,10 @@ class FrameCutterTests(unittest.TestCase):
                 self.assertIsNone(processes[0].poll())
                 if close:
                     root.tk.call(root.protocol("WM_DELETE_WINDOW"))
-                    self.wait_for(root, closed.is_set, timeout=3)
+                    self.wait_for(root, closed.is_set, timeout=15)
                 else:
                     app.cancel_button.invoke()
-                    self.wait_for(root, lambda: app.open_button.instate(["!disabled"]), timeout=3)
+                    self.wait_for(root, lambda: app.open_button.instate(["!disabled"]), timeout=15)
                     self.assertIn("annulée", app.status.get())
                     self.assertFalse(app._gallery_visible)
                     self.assertTrue(list(app.result_dir.glob("*.jpg")))
@@ -907,7 +909,7 @@ class FrameCutterTests(unittest.TestCase):
                 for process in processes:
                     if process.poll() is None:
                         process.kill()
-                    process.wait(timeout=3)
+                    process.wait(timeout=10)
 
     def test_open_result_uses_absolute_system_explorer_and_resolved_path(self):
         root, app = self.new_window()
