@@ -7,13 +7,18 @@ from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
+from urllib.request import ProxyHandler, Request
 
 from frame_engine import FrameCutterError, OperationCancelled
 from video_import import (
     IMPORT_MARKER,
     IMPORT_MARKER_CONTENT,
+    _HttpsRedirect,
+    _PublicHttpsConnection,
+    _PublicHttpsHandler,
     _check_platform_budget,
     _connect_public,
+    _download_direct,
     clean_abandoned_imports,
     create_import_folder,
     download_video,
@@ -168,6 +173,70 @@ class VideoImportSecurityTests(unittest.TestCase):
                           "--no-cookies", "--no-cookies-from-browser", "--use-extractors"):
                 self.assertIn(guard, commands)
             self.assertEqual(commands[-2:], ["--", link.url])
+
+    def test_https_redirect_rejects_downgrade_file_and_credentials(self):
+        handler = _HttpsRedirect()
+        request = Request("https://example.test/start.mp4")
+        for blocked_url in (
+            "http://example.test/video.mp4",
+            "file:///C:/video.mp4",
+            "https://CANARY_TEST_USER:CANARY_TEST_PASS@example.test/video.mp4",
+        ):
+            with self.subTest(blocked_url=blocked_url):
+                with self.assertRaises(FrameCutterError):
+                    handler.redirect_request(request, None, 302, "Found", {}, blocked_url)
+        allowed = handler.redirect_request(request, None, 302, "Found", {}, "https://example.test/next.mp4")
+        self.assertEqual(allowed.full_url, "https://example.test/next.mp4")
+
+    def test_public_https_handler_and_direct_opener_chain(self):
+        connection = _PublicHttpsConnection("example.test")
+        self.assertIs(connection._create_connection, _connect_public)
+
+        handler = _PublicHttpsHandler()
+        request = Request("https://example.test/video.mp4")
+        with patch.object(handler, "do_open", return_value="opened") as do_open:
+            self.assertEqual(handler.https_open(request), "opened")
+            self.assertIs(do_open.call_args.args[0], _PublicHttpsConnection)
+            self.assertIs(do_open.call_args.args[1], request)
+
+        captured_handlers = []
+        response = DownloadResponse(b"\x00\x00\x00\x18ftypisom", {"Content-Length": "12"})
+
+        def capture_opener(*handlers):
+            captured_handlers.extend(handlers)
+            return SimpleNamespace(open=lambda *_args, **_kwargs: response)
+
+        with tempfile.TemporaryDirectory() as temp, \
+                patch("video_import.MIN_FREE_BYTES", 0), \
+                patch("video_import.build_opener", side_effect=capture_opener):
+            _download_direct("https://example.test/video.mp4", Path(temp), threading.Event(), time.monotonic() + 30)
+
+        self.assertEqual(len(captured_handlers), 3)
+        self.assertIsInstance(captured_handlers[0], ProxyHandler)
+        self.assertEqual(captured_handlers[0].proxies, {})
+        self.assertIsInstance(captured_handlers[1], _PublicHttpsHandler)
+        self.assertIsInstance(captured_handlers[2], _HttpsRedirect)
+
+    def test_connect_public_blocks_ssrf_ipv4_and_ipv6_matrix(self):
+        blocked_targets = (
+            (socket.AF_INET, ("127.0.0.1", 443)),
+            (socket.AF_INET, ("169.254.169.254", 443)),
+            (socket.AF_INET, ("10.0.0.1", 443)),
+            (socket.AF_INET, ("100.64.0.1", 443)),
+            (socket.AF_INET6, ("::1", 443, 0, 0)),
+            (socket.AF_INET6, ("::ffff:127.0.0.1", 443, 0, 0)),
+            (socket.AF_INET6, ("fe80::1%1", 443, 0, 1)),
+            (socket.AF_INET6, ("fc00::1", 443, 0, 0)),
+            (socket.AF_INET6, ("2002:7f00:0001::", 443, 0, 0)),
+        )
+        for family, sockaddr in blocked_targets:
+            with self.subTest(addr=sockaddr[0]):
+                entry = (family, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", sockaddr)
+                with patch("video_import.socket.getaddrinfo", return_value=[entry]), \
+                        patch("video_import.socket.socket") as start_socket:
+                    with self.assertRaisesRegex(FrameCutterError, "serveur public"):
+                        _connect_public(("example.test", 443), 1)
+                    start_socket.assert_not_called()
 
 if __name__ == "__main__":
     unittest.main()
