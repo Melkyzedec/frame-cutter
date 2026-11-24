@@ -1,9 +1,11 @@
 import errno
 import hashlib
 import os
+import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
@@ -961,3 +963,254 @@ class FrameCutterTests(unittest.TestCase):
         for value in (float("nan"), float("inf"), float("-inf"), -5.0):
             with self.subTest(value=value):
                 self.assertEqual(format_duration(value), "00:00")
+
+
+class ReleaseHardeningTests(unittest.TestCase):
+    CANARY_WIN = r"C:\Users\CANARY_TEST_USER\Videos\secret_clip.mp4"
+    CANARY_WIN_D = r"D:\CANARY_TEST_DIR\secret_clip.mp4"
+    CANARY_WIN_E = r"E:\Users\CANARY_TEST_USER\Exports\secret_clip_frames"
+    CANARY_UNIX = "/Users/CANARY_TEST_USER/Videos/secret_clip.mp4"
+    CANARY_LINUX = "/home/CANARY_TEST_USER/secret_clip.mp4"
+
+    def assert_no_system_leak(self, text: str) -> None:
+        self.assertRegex(text.strip(), r"\S")
+        self.assertNotRegex(text, r"[A-Za-z]:[\\/]")
+        self.assertNotIn("\\\\", text)
+        self.assertNotIn("/Users/", text)
+        self.assertNotIn("/home/", text)
+        self.assertNotIn("CANARY_TEST_USER", text)
+        self.assertNotIn("CANARY_TEST_DIR", text)
+        self.assertNotIn("secret_clip.mp4", text)
+        self.assertNotIn("secret_clip_frames", text)
+        self.assertNotRegex(text, r"\[[^\]]+@\s*(?:0x)?[0-9a-fA-F]+\]")
+        self.assertNotIn("Error opening input", text)
+
+    def test_sanitize_user_error_strips_paths_and_ffmpeg_details(self):
+        from frame_engine import sanitize_user_error
+
+        samples = (
+            f"Impossible d'ouvrir '{self.CANARY_WIN}' : accès refusé",
+            f"Erreur sur {self.CANARY_WIN_D} et {self.CANARY_WIN_E}",
+            f"Lecture impossible pour {self.CANARY_UNIX} ou {self.CANARY_LINUX}",
+            f"Lien local refusé : file:///{self.CANARY_WIN.replace(chr(92), '/')}",
+            (
+                "Impossible de lire cette vidéo.\n"
+                "[http @ 000001f47d198080] Protocol 'http' not on whitelist 'file'!\n"
+                f"Error opening input file {self.CANARY_WIN}.\n"
+                f"{self.CANARY_WIN}: Invalid data found when processing input"
+            ),
+        )
+        for sample in samples:
+            with self.subTest(sample=sample):
+                cleaned = sanitize_user_error(sample)
+                self.assert_no_system_leak(cleaned)
+
+        kept = sanitize_user_error(
+            "Téléchargement gratuit : https://ffmpeg.org/download.html"
+        )
+        self.assertIn("https://ffmpeg.org/download.html", kept)
+
+    def test_engine_errors_hide_system_paths_and_raw_ffmpeg_stderr(self):
+        canary_path = Path(self.CANARY_WIN)
+
+        class FakeFailProcess:
+            returncode = 1
+
+            def __init__(self, canary_win):
+                self._canary_win = canary_win
+                self.stdout = iter(())
+                self.stderr = iter((
+                    "[in#0 @ 00000123456789ab] Error opening input: Invalid data\n",
+                    f"Error opening input file {canary_win}.\n",
+                ))
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def communicate(self, timeout=None):
+                return (
+                    "",
+                    "[mov,mp4,m4a @ 00000123456789ab] moov atom not found\n"
+                    f"{self._canary_win}: Invalid data found when processing input\n",
+                )
+
+            def poll(self):
+                return 1
+
+            def wait(self):
+                return 1
+
+        with tempfile.TemporaryDirectory() as temp:
+            temp_dir = Path(temp)
+
+            with patch("frame_engine.require_ffmpeg", return_value=("ffmpeg.exe", "ffprobe.exe")), \
+                    patch.object(Path, "is_file", return_value=True), \
+                    patch.object(Path, "resolve", return_value=canary_path):
+                with patch("frame_engine.subprocess.Popen", side_effect=OSError(errno.EACCES, "Permission denied", self.CANARY_WIN)):
+                    with self.assertRaises(FrameCutterError) as ctx:
+                        probe_video(canary_path)
+                    self.assert_no_system_leak(str(ctx.exception))
+
+                with patch("frame_engine._video_process", return_value=FakeFailProcess(self.CANARY_WIN)):
+                    with self.assertRaises(FrameCutterError) as ctx:
+                        probe_video(canary_path)
+                    self.assert_no_system_leak(str(ctx.exception))
+
+                with patch("frame_engine.subprocess.Popen", side_effect=OSError(errno.EACCES, "Permission denied", self.CANARY_WIN)):
+                    with self.assertRaises(FrameCutterError) as ctx:
+                        read_preview_frame(canary_path, 0.0, 160, 90, threading.Event())
+                    self.assert_no_system_leak(str(ctx.exception))
+
+            with patch.object(Path, "mkdir", side_effect=PermissionError(errno.EACCES, "Permission denied", self.CANARY_WIN_E)):
+                with self.assertRaises(FrameCutterError) as ctx:
+                    _available_output_dir(temp_dir, "clip")
+                self.assert_no_system_leak(str(ctx.exception))
+
+            out_dir = temp_dir / "out"
+            out_dir.mkdir()
+            with patch("frame_engine.require_ffmpeg", return_value=("ffmpeg.exe", "ffprobe.exe")), \
+                    patch.object(Path, "is_file", return_value=True), \
+                    patch.object(Path, "is_dir", return_value=True), \
+                    patch.object(Path, "resolve", side_effect=[canary_path, temp_dir]), \
+                    patch("frame_engine._available_output_dir", return_value=out_dir):
+                with patch("frame_engine.subprocess.Popen", side_effect=OSError(errno.ENOENT, "No such file", self.CANARY_WIN)):
+                    with self.assertRaises(FrameCutterError) as ctx:
+                        extract_frames(canary_path, temp_dir, 5, "JPEG", 2.0, lambda _: None, threading.Event())
+                    self.assert_no_system_leak(str(ctx.exception))
+
+            out_dir.mkdir(exist_ok=True)
+            with patch("frame_engine.require_ffmpeg", return_value=("ffmpeg.exe", "ffprobe.exe")), \
+                    patch.object(Path, "is_file", return_value=True), \
+                    patch.object(Path, "is_dir", return_value=True), \
+                    patch.object(Path, "resolve", side_effect=[canary_path, temp_dir]), \
+                    patch("frame_engine._available_output_dir", return_value=out_dir), \
+                    patch("frame_engine._video_process", return_value=FakeFailProcess(self.CANARY_WIN)):
+                with self.assertRaises(FrameCutterError) as ctx:
+                    extract_frames(canary_path, temp_dir, 5, "JPEG", 2.0, lambda _: None, threading.Event())
+                self.assert_no_system_leak(str(ctx.exception))
+
+    def test_app_error_messages_hide_system_paths_and_os_details(self):
+        root = tk.Tk()
+        root.withdraw()
+        app = FrameCutterApp(root)
+        try:
+            op_id = app._begin_operation()
+            with patch("app.probe_video", side_effect=RuntimeError(f"Crash at {self.CANARY_WIN}")):
+                app._probe_worker(op_id, Path(self.CANARY_WIN))
+            with patch("app.messagebox.showerror") as showerror:
+                app._poll_events()
+                showerror.assert_called_once()
+                self.assert_no_system_leak(showerror.call_args.args[1])
+                self.assert_no_system_leak(app.status.get())
+
+            op_id = app._begin_operation()
+            with patch("app.extract_frames", side_effect=OSError(errno.EACCES, "Permission denied", self.CANARY_WIN_D)):
+                app._extract_worker(op_id, Path(self.CANARY_WIN), Path(self.CANARY_WIN_E), 5.0, "JPEG", 2.0, ((0.0, 2.0),), None)
+            with patch("app.messagebox.showerror") as showerror:
+                app._poll_events()
+                showerror.assert_called_once()
+                self.assert_no_system_leak(showerror.call_args.args[1])
+                self.assert_no_system_leak(app.status.get())
+
+            op_id = app._begin_operation()
+            app.events.put((op_id, "error", FrameCutterError(f"Échec sur {self.CANARY_WIN}", output_dir=Path(self.CANARY_WIN_E))))
+            with patch("app.messagebox.showerror") as showerror:
+                app._poll_events()
+                showerror.assert_called_once()
+                self.assert_no_system_leak(showerror.call_args.args[1])
+                self.assert_no_system_leak(app.status.get())
+
+            app.result_dir = Path(self.CANARY_WIN_E)
+            app.busy = False
+            with patch.object(app.gallery, "load", side_effect=PermissionError(errno.EACCES, "Permission denied", self.CANARY_WIN_E)), \
+                    patch.object(app.gallery, "show_error") as show_error:
+                app._show_gallery(reveal=False)
+                show_error.assert_called_once()
+                self.assert_no_system_leak(show_error.call_args.args[0])
+
+            with patch.object(Path, "is_dir", return_value=True), \
+                    patch.object(Path, "resolve", return_value=Path(self.CANARY_WIN_E)), \
+                    patch("app.subprocess.Popen", side_effect=FileNotFoundError(errno.ENOENT, "Not found", self.CANARY_WIN)), \
+                    patch("app.messagebox.showerror") as showerror:
+                app._open_result()
+                showerror.assert_called_once()
+                self.assert_no_system_leak(showerror.call_args.args[1])
+        finally:
+            if app._poll_job is not None:
+                root.after_cancel(app._poll_job)
+                app._poll_job = None
+            app.preview.clear()
+            app.gallery.destroy()
+            root.destroy()
+
+    def test_requirements_import_pins_versions_and_valid_sha256_hashes(self):
+        project = Path(__file__).resolve().parents[1]
+        req_file = project / "requirements-import.txt"
+        self.assertTrue(req_file.is_file())
+        raw_lines = req_file.read_text(encoding="utf-8").splitlines()
+        logical_lines = []
+        current = ""
+        for raw in raw_lines:
+            stripped = raw.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if stripped.endswith("\\"):
+                current += " " + stripped[:-1].strip()
+            else:
+                current += " " + stripped
+                logical_lines.append(current.strip())
+                current = ""
+        if current.strip():
+            logical_lines.append(current.strip())
+
+        self.assertGreaterEqual(len(logical_lines), 2)
+        seen_packages = set()
+        for entry in logical_lines:
+            spec = entry.split("--hash=", 1)[0].strip()
+            self.assertRegex(spec, r"^[A-Za-z0-9_.-]+==[A-Za-z0-9_.-]+$")
+            seen_packages.add(spec.split("==", 1)[0].lower())
+            hashes = re.findall(r"--hash=sha256:([0-9a-fA-F]+)", entry)
+            self.assertGreaterEqual(len(hashes), 1, f"Missing sha256 hash in: {entry}")
+            for digest in hashes:
+                self.assertEqual(len(digest), 64)
+                self.assertRegex(digest, r"^[0-9a-f]{64}$")
+
+        self.assertIn("yt-dlp", seen_packages)
+        self.assertIn("yt-dlp-ejs", seen_packages)
+
+        dry_run = subprocess.run(
+            [
+                sys.executable, "-m", "pip", "install",
+                "--dry-run", "--disable-pip-version-check",
+                "--ignore-installed", "--require-hashes",
+                "-r", str(req_file),
+            ],
+            capture_output=True, text=True, timeout=60,
+        )
+        self.assertEqual(dry_run.returncode, 0, dry_run.stderr or dry_run.stdout)
+
+    def test_ci_workflow_is_read_only_and_pins_actions_to_full_commit_sha(self):
+        project = Path(__file__).resolve().parents[1]
+        workflow_path = project / ".github" / "workflows" / "tests.yml"
+        self.assertTrue(workflow_path.is_file(), "Le workflow CI .github/workflows/tests.yml est manquant.")
+        content = workflow_path.read_text(encoding="utf-8")
+        self.assertIn("push:", content)
+        self.assertIn("pull_request:", content)
+        self.assertIn("main", content)
+        self.assertRegex(content, r"permissions:\s*\n\s+contents:\s*read\b")
+        self.assertNotRegex(content, r":\s*write\b")
+
+        uses_refs = re.findall(r"^\s*-?\s*uses:\s*([^\s#]+)", content, flags=re.MULTILINE)
+        self.assertGreaterEqual(len(uses_refs), 2)
+        for ref in uses_refs:
+            self.assertRegex(
+                ref,
+                r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40}$",
+                f"Action must be pinned to a full 40-char commit SHA: {ref}",
+            )
+
+        self.assertIn("python -B -W default -m unittest discover -s tests -v", content)
+        self.assertIn("--require-hashes", content)

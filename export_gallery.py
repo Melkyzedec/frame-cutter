@@ -12,7 +12,7 @@ from pathlib import Path
 from tkinter import ttk
 from typing import Callable
 
-from frame_engine import FrameCutterError, OperationCancelled, read_preview_frame
+from frame_engine import FrameCutterError, OperationCancelled, format_os_error, read_preview_frame
 from ui_style import ACCENT, BACKGROUND, BODY, INK, L, M, S, XS, step_heading
 
 
@@ -323,7 +323,8 @@ class ExportGallery(ttk.Frame):
         try:
             self._confirmation = (path, self._image_stat(path))
         except OSError as exc:
-            self._show_notice(f"Suppression impossible. {exc}")
+            detail = format_os_error(exc, "Vérifiez les droits d’accès au dossier ou à l’image.")
+            self._show_notice(f"Suppression impossible. {detail}")
             return
         self._notice.pack_forget()
         self._question.set(f"Supprimer définitivement {path.name} ?")
@@ -353,7 +354,8 @@ class ExportGallery(ttk.Frame):
                 raise OSError("L’image sélectionnée a changé depuis la confirmation.")
             path.unlink()
         except OSError as exc:
-            self._show_notice(f"Suppression impossible. {exc}")
+            detail = format_os_error(exc, "Vérifiez que le fichier n’est pas verrouillé et reste accessible.")
+            self._show_notice(f"Suppression impossible. {detail}")
             self._update_buttons()
             return
         del self._paths[index]

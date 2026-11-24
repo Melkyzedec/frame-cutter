@@ -14,7 +14,10 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from export_gallery import ExportGallery
-from frame_engine import FrameCutterError, OperationCancelled, VideoInfo, extract_frames, format_duration, probe_video
+from frame_engine import (
+    FrameCutterError, OperationCancelled, VideoInfo, extract_frames, format_duration, format_os_error, probe_video,
+    sanitize_user_error,
+)
 from link_dialog import LinkDialog
 from ui_style import BACKGROUND, L, M, S, XL, XS, apply_style, step_heading
 from video_import import VideoLink, clean_abandoned_imports, create_import_folder, download_video, remove_import_folder, save_video_copy
@@ -288,8 +291,8 @@ class FrameCutterApp:
             self.events.put((operation_id, "probe_ok", info))
         except FrameCutterError as exc:
             self.events.put((operation_id, "error", exc))
-        except Exception as exc:  # surface unexpected environment/decoder failures cleanly
-            self.events.put((operation_id, "error", FrameCutterError(f"Erreur inattendue pendant l’analyse : {exc}")))
+        except Exception:  # surface unexpected environment/decoder failures cleanly
+            self.events.put((operation_id, "error", FrameCutterError("Erreur inattendue pendant l’analyse de la vidéo.")))
 
     def _choose_link(self) -> None:
         if self.busy or self._closing:
@@ -539,8 +542,8 @@ class FrameCutterApp:
             self.events.put((operation_id, "done", result))
         except FrameCutterError as exc:
             self.events.put((operation_id, "error", exc))
-        except Exception as exc:
-            self.events.put((operation_id, "error", FrameCutterError(f"Erreur inattendue pendant l’extraction : {exc}")))
+        except Exception:
+            self.events.put((operation_id, "error", FrameCutterError("Erreur inattendue pendant l’extraction des images.")))
 
     def _cancel(self) -> None:
         if self.busy:
@@ -631,11 +634,15 @@ class FrameCutterApp:
                         self.video_details.set("Aucune vidéo prête.")
                         self._discard_import()
                     self._set_busy_controls(False)
-                    self.status.set(str(payload).splitlines()[0])
+                    safe_message = sanitize_user_error(str(payload))
+                    self.status.set(safe_message.splitlines()[0])
                     if not isinstance(payload, OperationCancelled):
-                        detail = str(payload)
+                        detail = safe_message
                         if payload.output_dir is not None:
-                            detail += f"\n\nDossier de résultat :\n{payload.output_dir}"
+                            detail += (
+                                "\n\nLes images déjà extraites ont été conservées. "
+                                "Utilisez « Ouvrir le dossier » ou « Voir les images » pour y accéder."
+                            )
                         messagebox.showerror(APP_NAME, detail, parent=self.root)
         except queue.Empty:
             pass
@@ -684,7 +691,8 @@ class FrameCutterApp:
         try:
             self.gallery.load(self.result_dir)
         except OSError as exc:
-            self.gallery.show_error(f"Impossible d’afficher les images.\n{exc}")
+            detail = format_os_error(exc, "Vérifiez que le dossier existe et est accessible.")
+            self.gallery.show_error(f"Impossible d’afficher les images.\n{detail}")
         self._gallery_visible = True
         self._place_workspace_panels()
         if reveal or self._compact:
@@ -706,8 +714,12 @@ class FrameCutterApp:
             return
         try:
             subprocess.Popen([_resolve_explorer_executable(), str(result_dir.resolve())])
-        except OSError as exc:
-            messagebox.showerror(APP_NAME, f"Impossible d’ouvrir le dossier : {exc}")
+        except OSError:
+            messagebox.showerror(
+                APP_NAME,
+                "Impossible d’ouvrir le dossier de résultats dans l’Explorateur Windows.",
+                parent=self.root,
+            )
 
 
 def _resolve_explorer_executable() -> str:
