@@ -106,6 +106,7 @@ def probe_video(path: Path, cancel_event: threading.Event | None = None) -> Vide
     _, ffprobe = require_ffmpeg()
     if not path.is_file():
         raise FrameCutterError("Le fichier vidéo sélectionné n’existe plus.")
+    path = path.resolve(strict=True)
 
     command = [
         ffprobe,
@@ -113,7 +114,7 @@ def probe_video(path: Path, cancel_event: threading.Event | None = None) -> Vide
         "-protocol_whitelist", "file",
         "-show_entries", "format=duration:stream=codec_type,width,height,avg_frame_rate,r_frame_rate",
         "-of", "json",
-        str(path),
+        "-i", str(path),
     ]
     try:
         with _video_process(command, cancel_event) as process:
@@ -164,6 +165,7 @@ def read_preview_frame(
         raise OperationCancelled("Aperçu annulé.")
     if not path.is_file() or not math.isfinite(seconds) or seconds < 0:
         raise FrameCutterError("La vidéo ou la position de l’aperçu est invalide.")
+    path = path.resolve(strict=True)
     ffmpeg, _ = require_ffmpeg()
     command = [
         ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin",
@@ -197,6 +199,8 @@ def read_preview_frame(
 
 
 def format_duration(seconds: float) -> str:
+    if not math.isfinite(seconds) or seconds <= 0:
+        return "00:00"
     whole = max(0, int(seconds + 0.5))
     hours, remainder = divmod(whole, 3600)
     minutes, secs = divmod(remainder, 60)
@@ -241,15 +245,20 @@ def validate_portions(duration: float, portions: Sequence[tuple[float, float]]) 
 
 
 def _available_output_dir(parent: Path, stem: str) -> Path:
-    base = parent / f"{stem}_frames"
+    if not stem or stem in {".", ".."} or "/" in stem or "\\" in stem or ".." in stem or "\x00" in stem:
+        raise FrameCutterError("Nom de dossier de résultat invalide.")
+    resolved_parent = parent.resolve()
+    base = resolved_parent / f"{stem}_frames"
     candidate = base
     suffix = 2
     while True:
+        if candidate.resolve().parent != resolved_parent:
+            raise FrameCutterError("Nom de dossier de résultat invalide.")
         try:
             candidate.mkdir()
             return candidate
         except FileExistsError:
-            candidate = parent / f"{stem}_frames_{suffix}"
+            candidate = resolved_parent / f"{stem}_frames_{suffix}"
             suffix += 1
         except OSError as exc:
             if exc.errno == errno.ENOSPC or getattr(exc, "winerror", None) == 112:
@@ -289,6 +298,8 @@ def extract_frames(
         raise FrameCutterError("Le fichier vidéo sélectionné n’existe plus.")
     if not destination_parent.is_dir():
         raise FrameCutterError("Le dossier de destination n’existe pas ou n’est pas accessible.")
+    source = source.resolve(strict=True)
+    destination_parent = destination_parent.resolve(strict=True)
 
     output_dir = _available_output_dir(destination_parent, source.stem)
     extension = "jpg" if image_format == "JPEG" else "png"
@@ -303,10 +314,22 @@ def extract_frames(
                 cancel_event, interval_seconds=interval_seconds,
             )
         except OperationCancelled:
+            if next_frame == 1 and output_dir.is_dir() and not any(output_dir.iterdir()):
+                try:
+                    output_dir.rmdir()
+                except OSError:
+                    pass
             raise
         except FrameCutterError as exc:
+            if next_frame == 1 and output_dir.is_dir() and not any(output_dir.iterdir()):
+                try:
+                    output_dir.rmdir()
+                except OSError:
+                    pass
+                if exc.output_dir == output_dir:
+                    exc = FrameCutterError(str(exc), None)
             if len(portions) == 1:
-                raise
+                raise exc
             raise FrameCutterError(f"Passage {index} sur {len(portions)}. {exc}", output_dir) from exc
         elapsed += end - start
     progress(100.0)

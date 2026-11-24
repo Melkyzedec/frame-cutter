@@ -1,5 +1,6 @@
 import errno
 import hashlib
+import os
 import shutil
 import subprocess
 import sys
@@ -16,7 +17,16 @@ from uuid import uuid4
 
 import app as app_module
 from app import FrameCutterApp
-from frame_engine import FrameCutterError, OperationCancelled, extract_frames, probe_video, read_preview_frame, require_ffmpeg
+from frame_engine import (
+    FrameCutterError,
+    OperationCancelled,
+    _available_output_dir,
+    extract_frames,
+    format_duration,
+    probe_video,
+    read_preview_frame,
+    require_ffmpeg,
+)
 from video_import import parse_video_link
 
 
@@ -140,7 +150,7 @@ class FrameCutterTests(unittest.TestCase):
         source = self.destination / "cadence variable.mp4"
         subprocess.run(
             [self.ffmpeg, "-v", "error", "-i", str(self.source),
-             "-vf", "select=if(lt(t\,1)\,not(mod(n\,2))\,not(mod(n-1\,3)))",
+             "-vf", r"select=if(lt(t\,1)\,not(mod(n\,2))\,not(mod(n-1\,3)))",
              "-fps_mode", "vfr", "-c:v", "mpeg4", str(source)],
             check=True, capture_output=True, timeout=15,
         )
@@ -483,7 +493,7 @@ class FrameCutterTests(unittest.TestCase):
         self.assertEqual(reel.url, "https://www.instagram.com/reel/abcdefghijk/")
         for url, bounds in (
             ("file:///C:/video.mp4", None),
-            ("https://user:password@example.invalid/video.mp4", None),
+            ("https://CANARY_TEST_USER:CANARY_TEST_PASS@example.test/video.mp4", None),
             ("https://www.youtube.com/playlist?list=playlist", None),
             ("https://www.instagram.com/p/abcdefghijk/", None),
             ("https://www.instagram.com/reel/abcdefghijk/", (5, 8)),
@@ -896,3 +906,58 @@ class FrameCutterTests(unittest.TestCase):
                     if process.poll() is None:
                         process.kill()
                     process.wait(timeout=3)
+
+    def test_open_result_uses_absolute_system_explorer_and_resolved_path(self):
+        root, app = self.new_window()
+        export_dir = self.destination / "export_dir"
+        export_dir.mkdir()
+        relative_dir = Path(os.path.relpath(export_dir, Path.cwd()))
+        app.result_dir = relative_dir
+        expected_explorer = str(Path(os.environ.get("SystemRoot", r"C:\Windows")) / "explorer.exe")
+        with patch("app.subprocess.Popen") as popen:
+            app._open_result()
+            popen.assert_called_once()
+            command = popen.call_args.args[0]
+            self.assertEqual(command[0], expected_explorer)
+            self.assertNotEqual(command[0].lower(), "explorer")
+            self.assertEqual(command[1], str(export_dir.resolve()))
+
+    def test_leading_dash_relative_paths_work_without_cli_option_injection(self):
+        dash_video = self.destination / "-v.mp4"
+        shutil.copyfile(self.source, dash_video)
+        dash_out = self.destination / "-out"
+        dash_out.mkdir()
+        previous_cwd = Path.cwd()
+        os.chdir(self.destination)
+        try:
+            info = probe_video(Path("-v.mp4"))
+            self.assertEqual((info.duration, info.width, info.height), (2, 160, 90))
+            preview = read_preview_frame(Path("-v.mp4"), 0, 160, 90, threading.Event())
+            self.assertTrue(preview.startswith(b"\x89PNG\r\n\x1a\n"))
+            output = extract_frames(Path("-v.mp4"), Path("-out"), 5, "JPEG", 2, lambda _: None, threading.Event())
+            self.assertEqual(output, (dash_out / "-v_frames").resolve())
+            self.assertEqual(len(list(output.glob("frame_*.jpg"))), 10)
+        finally:
+            os.chdir(previous_cwd)
+
+    def test_available_output_dir_rejects_path_traversal_stems(self):
+        sub = self.destination / "confined"
+        sub.mkdir()
+        for bad_stem in ("..\\escaped", "../escaped", "nested/dir", "nested\\dir", "..", "."):
+            with self.subTest(bad_stem=bad_stem):
+                with self.assertRaises(FrameCutterError):
+                    _available_output_dir(sub, bad_stem)
+        self.assertEqual(list(sub.iterdir()), [])
+        self.assertFalse((self.destination / "escaped_frames").exists())
+
+    def test_failed_extraction_on_corrupt_video_cleans_empty_output_dir(self):
+        corrupt = self.destination / "corrompue.mp4"
+        corrupt.write_bytes(b"")
+        with self.assertRaises(FrameCutterError):
+            extract_frames(corrupt, self.destination, 5, "JPEG", 2, lambda _: None, threading.Event())
+        self.assertEqual(list(self.destination.iterdir()), [corrupt])
+
+    def test_format_duration_handles_non_finite_values(self):
+        for value in (float("nan"), float("inf"), float("-inf"), -5.0):
+            with self.subTest(value=value):
+                self.assertEqual(format_duration(value), "00:00")

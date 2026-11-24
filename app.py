@@ -705,9 +705,13 @@ class FrameCutterApp:
         if not result_dir or not result_dir.is_dir():
             return
         try:
-            subprocess.Popen(["explorer", str(result_dir)])
+            subprocess.Popen([_resolve_explorer_executable(), str(result_dir.resolve())])
         except OSError as exc:
             messagebox.showerror(APP_NAME, f"Impossible d’ouvrir le dossier : {exc}")
+
+
+def _resolve_explorer_executable() -> str:
+    return str(Path(os.environ.get("SystemRoot", r"C:\Windows")) / "explorer.exe")
 
 
 def main() -> None:
