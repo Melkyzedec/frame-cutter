@@ -20,6 +20,86 @@ from typing import Callable, Iterator, Sequence
 APP_DIR = Path(__file__).resolve().parent
 FFMPEG_DIR = APP_DIR / "tools" / "ffmpeg" / "bin"
 _PREVIEW_DECODE_LOCK = threading.Lock()
+_FFMPEG_LOG_PREFIX_RE = re.compile(r"^\s*\[[^\]]+@\s*(?:0x)?[0-9a-fA-F]+\]")
+_FFMPEG_NOISE_PREFIXES = (
+    "error opening input",
+    "ffmpeg version",
+    "built with",
+    "configuration:",
+    "libav",
+)
+_FILE_URI_RE = re.compile(r"""file://[^\s'"<>|\r\n]+""", re.IGNORECASE)
+_QUOTED_SYSTEM_PATH_RE = re.compile(
+    r"""(['"])(?:(?<![A-Za-z0-9+.-])[A-Za-z]:(?!//)[\\/]|\\\\|/(?:Users|home|root|tmp|var|etc|opt|usr|mnt|media|Volumes|private)/)[^'"\r\n]+\1"""
+)
+_WIN_SYSTEM_PATH_RE = re.compile(
+    r"""(?<![A-Za-z0-9+.-])(?:[A-Za-z]:(?!//)[\\/]|\\\\)[^\s'"<>|\r\n]+(?: +[^\s:'"<>|\r\n]*[\\/][^\s'"<>|\r\n]+)*"""
+)
+_UNIX_SYSTEM_PATH_RE = re.compile(
+    r"""(?<![:/A-Za-z0-9_.-])/(?:(?:Users|home|root|tmp|var|etc|opt|usr|mnt|media|Volumes|private)/[^\s'"<>|\r\n]+|(?:[A-Za-z0-9._-]+/)+[A-Za-z0-9._-]+)"""
+)
+_FFMPEG_ERROR_TABLE = (
+    (
+        "no space left on device",
+        {
+            "probe": "Espace disque insuffisant pour analyser cette vidéo.",
+            "extract": "Espace disque insuffisant. Libérez de la place ou choisissez un autre dossier.",
+        },
+    ),
+    (
+        "not on whitelist",
+        {
+            "probe": "Impossible de lire cette vidéo : protocole externe non autorisé (not on whitelist).",
+            "extract": "L’extraction a échoué : protocole externe non autorisé (not on whitelist).",
+        },
+    ),
+    (
+        "permission denied",
+        {
+            "probe": "Impossible de lire cette vidéo : accès au fichier refusé.",
+            "extract": "L’extraction a échoué : accès au fichier ou au dossier refusé.",
+        },
+    ),
+)
+_FFMPEG_DEFAULT_MESSAGES = {
+    "probe": "Impossible de lire cette vidéo. Vérifiez que le fichier est une vidéo valide.",
+    "extract": "L’extraction a échoué. Vérifiez la vidéo et l’accès au dossier de destination.",
+}
+
+
+def sanitize_user_error(message: str, fallback: str = "Une erreur technique est survenue.") -> str:
+    """Strip local filesystem paths and raw FFmpeg log lines from user-facing messages."""
+    kept_lines: list[str] = []
+    for raw_line in message.splitlines():
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+        if _FFMPEG_LOG_PREFIX_RE.match(stripped) or stripped.lower().startswith(_FFMPEG_NOISE_PREFIXES):
+            continue
+        cleaned = _FILE_URI_RE.sub("ce chemin", raw_line)
+        cleaned = _QUOTED_SYSTEM_PATH_RE.sub("ce chemin", cleaned)
+        cleaned = _WIN_SYSTEM_PATH_RE.sub("ce chemin", cleaned)
+        cleaned = _UNIX_SYSTEM_PATH_RE.sub("ce chemin", cleaned)
+        cleaned = re.sub(r"[ \t]{2,}", " ", cleaned).strip()
+        if cleaned and re.search(r"[A-Za-z0-9À-ÿ]", cleaned):
+            kept_lines.append(cleaned)
+    return "\n".join(kept_lines) if kept_lines else fallback
+
+
+def format_os_error(exc: OSError, fallback: str) -> str:
+    """Format an OSError without exposing raw OS details or filesystem paths."""
+    if exc.errno is not None or getattr(exc, "winerror", None) is not None:
+        return fallback
+    return sanitize_user_error(str(exc), fallback=fallback)
+
+
+def _classify_ffmpeg_error(stderr: str, *, context: str) -> str:
+    """Map raw FFmpeg/ffprobe stderr output to a safe French user error message."""
+    lowered = stderr.lower()
+    for token, messages in _FFMPEG_ERROR_TABLE:
+        if token in lowered:
+            return messages[context]
+    return _FFMPEG_DEFAULT_MESSAGES[context]
 
 
 class FrameCutterError(RuntimeError):
@@ -106,7 +186,10 @@ def probe_video(path: Path, cancel_event: threading.Event | None = None) -> Vide
     _, ffprobe = require_ffmpeg()
     if not path.is_file():
         raise FrameCutterError("Le fichier vidéo sélectionné n’existe plus.")
-    path = path.resolve(strict=True)
+    try:
+        path = path.resolve(strict=True)
+    except OSError as exc:
+        raise FrameCutterError("Impossible d’accéder au fichier vidéo sélectionné.") from exc
 
     command = [
         ffprobe,
@@ -123,13 +206,12 @@ def probe_video(path: Path, cancel_event: threading.Event | None = None) -> Vide
     except subprocess.TimeoutExpired as exc:
         raise FrameCutterError("La lecture des informations de la vidéo a dépassé 30 secondes.") from exc
     except OSError as exc:
-        raise FrameCutterError(f"Impossible de lancer ffprobe : {exc}") from exc
+        raise FrameCutterError("Impossible de lancer l’outil d’analyse vidéo (ffprobe).") from exc
 
     if cancel_event is not None and cancel_event.is_set():
         raise OperationCancelled("Analyse annulée.")
     if return_code != 0:
-        detail = stderr.strip() or "Format vidéo non reconnu."
-        raise FrameCutterError(f"Impossible de lire cette vidéo.\n{detail[-1200:]}")
+        raise FrameCutterError(_classify_ffmpeg_error(stderr, context="probe"))
 
     try:
         metadata = json.loads(stdout)
@@ -165,7 +247,10 @@ def read_preview_frame(
         raise OperationCancelled("Aperçu annulé.")
     if not path.is_file() or not math.isfinite(seconds) or seconds < 0:
         raise FrameCutterError("La vidéo ou la position de l’aperçu est invalide.")
-    path = path.resolve(strict=True)
+    try:
+        path = path.resolve(strict=True)
+    except OSError as exc:
+        raise FrameCutterError("Impossible d’accéder au fichier vidéo sélectionné.") from exc
     ffmpeg, _ = require_ffmpeg()
     command = [
         ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin",
@@ -263,7 +348,7 @@ def _available_output_dir(parent: Path, stem: str) -> Path:
         except OSError as exc:
             if exc.errno == errno.ENOSPC or getattr(exc, "winerror", None) == 112:
                 raise FrameCutterError("Espace disque insuffisant. Libérez de la place ou choisissez un autre dossier.") from exc
-            raise FrameCutterError(f"Impossible de créer le dossier de résultat. Choisissez un dossier accessible.\n{exc}") from exc
+            raise FrameCutterError("Impossible de créer le dossier de résultat. Choisissez un dossier accessible.") from exc
 
 
 def extract_frames(
@@ -298,8 +383,11 @@ def extract_frames(
         raise FrameCutterError("Le fichier vidéo sélectionné n’existe plus.")
     if not destination_parent.is_dir():
         raise FrameCutterError("Le dossier de destination n’existe pas ou n’est pas accessible.")
-    source = source.resolve(strict=True)
-    destination_parent = destination_parent.resolve(strict=True)
+    try:
+        source = source.resolve(strict=True)
+        destination_parent = destination_parent.resolve(strict=True)
+    except OSError as exc:
+        raise FrameCutterError("Impossible d’accéder au fichier vidéo ou au dossier de destination.") from exc
 
     output_dir = _available_output_dir(destination_parent, source.stem)
     extension = "jpg" if image_format == "JPEG" else "png"
@@ -394,17 +482,13 @@ def _extract_portion(
             return_code = process.wait()
             stderr_thread.join()
     except OSError as exc:
-        raise FrameCutterError(f"Impossible d’exécuter FFmpeg.\n{exc}", output_dir) from exc
+        raise FrameCutterError("Impossible d’exécuter FFmpeg.", output_dir) from exc
 
     if cancel_event.is_set():
         raise OperationCancelled("Extraction annulée. Les images déjà créées sont conservées.", output_dir)
     if return_code != 0:
-        detail = "\n".join(stderr_lines).strip() or "Erreur FFmpeg sans détail supplémentaire."
-        if "no space left on device" in detail.lower():
-            message = "Espace disque insuffisant. Libérez de la place ou choisissez un autre dossier."
-        else:
-            message = "L’extraction a échoué. Vérifiez la vidéo et l’accès au dossier de destination."
-        raise FrameCutterError(f"{message}\n{detail[-1600:]}", output_dir)
+        detail = "\n".join(stderr_lines).strip()
+        raise FrameCutterError(_classify_ffmpeg_error(detail, context="extract"), output_dir)
     if frame_count == 0 or not (output_dir / f"frame_{first_frame + frame_count - 1:06d}.{extension}").is_file():
         raise FrameCutterError("Aucune image exportée. Ajustez la portion ou le rythme.", output_dir)
     return first_frame + frame_count
