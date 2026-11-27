@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 import queue
@@ -15,8 +16,8 @@ from tkinter import filedialog, messagebox, ttk
 
 from export_gallery import ExportGallery
 from frame_engine import (
-    FrameCutterError, OperationCancelled, VideoInfo, extract_frames, format_duration, format_os_error, probe_video,
-    sanitize_user_error,
+    FrameCutterError, OperationCancelled, VideoInfo, extract_frames, format_duration, format_os_error,
+    log_unexpected_error, probe_video, sanitize_user_error,
 )
 from link_dialog import LinkDialog
 from ui_style import BACKGROUND, L, M, S, XL, XS, apply_style, step_heading
@@ -291,7 +292,8 @@ class FrameCutterApp:
             self.events.put((operation_id, "probe_ok", info))
         except FrameCutterError as exc:
             self.events.put((operation_id, "error", exc))
-        except Exception:  # surface unexpected environment/decoder failures cleanly
+        except Exception as exc:  # surface unexpected environment/decoder failures cleanly
+            log_unexpected_error("analyse vidéo", exc)
             self.events.put((operation_id, "error", FrameCutterError("Erreur inattendue pendant l’analyse de la vidéo.")))
 
     def _choose_link(self) -> None:
@@ -337,7 +339,8 @@ class FrameCutterApp:
             folder = None
         except FrameCutterError as exc:
             self.events.put((operation_id, "error", exc))
-        except Exception:
+        except Exception as exc:
+            log_unexpected_error("import vidéo", exc)
             self.events.put((operation_id, "error", FrameCutterError("Erreur inattendue pendant l’import vidéo.")))
         finally:
             if folder is not None:
@@ -365,7 +368,8 @@ class FrameCutterApp:
             self.events.put((operation_id, "saved", saved))
         except FrameCutterError as exc:
             self.events.put((operation_id, "error", exc))
-        except Exception:
+        except Exception as exc:
+            log_unexpected_error("enregistrement vidéo", exc)
             self.events.put((operation_id, "error", FrameCutterError("Erreur inattendue pendant l’enregistrement vidéo.")))
         finally:
             if folder is not None:
@@ -542,7 +546,8 @@ class FrameCutterApp:
             self.events.put((operation_id, "done", result))
         except FrameCutterError as exc:
             self.events.put((operation_id, "error", exc))
-        except Exception:
+        except Exception as exc:
+            log_unexpected_error("extraction des images", exc)
             self.events.put((operation_id, "error", FrameCutterError("Erreur inattendue pendant l’extraction des images.")))
 
     def _cancel(self) -> None:
@@ -727,6 +732,8 @@ def _resolve_explorer_executable() -> str:
 
 
 def main() -> None:
+    # Unexpected errors go to stderr, already stripped of personal paths by log_unexpected_error.
+    logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     clean_abandoned_imports()
     if os.name == "nt" and getattr(sys, "frozen", False):
         import ctypes

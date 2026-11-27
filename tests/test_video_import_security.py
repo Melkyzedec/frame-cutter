@@ -1,4 +1,6 @@
+import re
 import socket
+import sys
 import tempfile
 import time
 import threading
@@ -160,7 +162,18 @@ class VideoImportSecurityTests(unittest.TestCase):
                 Path(cwd, "youtube-abcdefghijk.mkv").write_bytes(b"video with audio")
                 return Completed()
 
-            with patch("video_import.find_spec", return_value=object()), patch("video_import.require_ffmpeg", return_value=("ffmpeg.exe", "ffprobe.exe")), patch("video_import.shutil.which", return_value="node.exe"), patch("video_import.subprocess.Popen", side_effect=start):
+            # Composants d’import fictifs : version épinglée et node.exe fourni, rien n’est exécuté.
+            tools_dir = tempfile.TemporaryDirectory()
+            self.addCleanup(tools_dir.cleanup)
+            tools = Path(tools_dir.name)
+            pinned = re.search(r"^yt-dlp==(\S+)", (Path(__file__).resolve().parents[1] / "requirements-import.txt")
+                               .read_text(encoding="utf-8"), re.M).group(1)
+            for package in ("yt_dlp", "yt_dlp_ejs"):
+                (tools / package).mkdir()
+                (tools / package / "__init__.py").write_text("", encoding="utf-8")
+            (tools / "yt_dlp" / "version.py").write_text(f"__version__ = '{pinned}'\n", encoding="utf-8")
+            (tools / "node.exe").write_bytes(b"CANARY_TEST")
+            with patch("video_import.IMPORT_TOOLS", tools), patch("video_import.require_ffmpeg", return_value=("ffmpeg.exe", "ffprobe.exe")), patch("video_import.subprocess.Popen", side_effect=start):
                 downloaded = _download_platform(
                     link, folder, threading.Event(), time.monotonic() + 30, preserve_audio=True,
                 )
@@ -173,6 +186,8 @@ class VideoImportSecurityTests(unittest.TestCase):
                           "--no-cookies", "--no-cookies-from-browser", "--use-extractors"):
                 self.assertIn(guard, commands)
             self.assertEqual(commands[-2:], ["--", link.url])
+            # -P : le dossier d’import (cwd) n’est pas ajouté à sys.path du sous-processus.
+            self.assertEqual(commands[:5], [sys.executable, "-B", "-P", "-m", "yt_dlp"])
 
     def test_https_redirect_rejects_downgrade_file_and_credentials(self):
         handler = _HttpsRedirect()
@@ -183,7 +198,7 @@ class VideoImportSecurityTests(unittest.TestCase):
             "https://CANARY_TEST_USER:CANARY_TEST_PASS@example.test/video.mp4",
         ):
             with self.subTest(blocked_url=blocked_url):
-                with self.assertRaises(FrameCutterError):
+                with self.assertRaisesRegex(FrameCutterError, "lien HTTPS valide"):
                     handler.redirect_request(request, None, 302, "Found", {}, blocked_url)
         allowed = handler.redirect_request(request, None, 302, "Found", {}, "https://example.test/next.mp4")
         self.assertEqual(allowed.full_url, "https://example.test/next.mp4")
@@ -228,6 +243,18 @@ class VideoImportSecurityTests(unittest.TestCase):
             (socket.AF_INET6, ("fe80::1%1", 443, 0, 1)),
             (socket.AF_INET6, ("fc00::1", 443, 0, 0)),
             (socket.AF_INET6, ("2002:7f00:0001::", 443, 0, 0)),
+            # Plages ajoutées (tranche 1) : site-local obsolète, multicast, réservé, NAT64, Teredo…
+            (socket.AF_INET6, ("fec0::1", 443, 0, 0)),
+            (socket.AF_INET6, ("ff02::1", 443, 0, 0)),
+            (socket.AF_INET6, ("64:ff9b::7f00:1", 443, 0, 0)),
+            (socket.AF_INET6, ("2001::1", 443, 0, 0)),
+            (socket.AF_INET6, ("::127.0.0.1", 443, 0, 0)),
+            (socket.AF_INET, ("0.0.0.0", 443)),
+            (socket.AF_INET, ("198.18.0.1", 443)),
+            (socket.AF_INET, ("224.0.0.1", 443)),
+            (socket.AF_INET, ("239.255.255.250", 443)),
+            (socket.AF_INET, ("240.0.0.1", 443)),
+            (socket.AF_INET, ("255.255.255.255", 443)),
         )
         for family, sockaddr in blocked_targets:
             with self.subTest(addr=sockaddr[0]):
