@@ -9,24 +9,38 @@ import queue
 import subprocess
 import sys
 import threading
-import tkinter as tk
 from dataclasses import dataclass
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
 
-from export_gallery import ExportGallery
 from frame_engine import (
-    FrameCutterError, OperationCancelled, VideoInfo, extract_frames, format_duration, format_os_error,
-    log_unexpected_error, probe_video, sanitize_user_error,
+    FrameCutterError, OperationCancelled, VideoInfo, extract_frames, format_duration, format_frame_rate,
+    format_os_error, log_unexpected_error, probe_video, require_ffmpeg, sanitize_user_error,
 )
-from link_dialog import LinkDialog
-from ui_style import BACKGROUND, L, M, S, XL, XS, apply_style, step_heading
 from video_import import VideoLink, clean_abandoned_imports, create_import_folder, download_video, remove_import_folder, save_video_copy
-from video_preview import VideoPreview
+
+# The window needs Tkinter. Without it, main() explains the problem in French instead of a raw traceback.
+try:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, ttk
+
+    from export_gallery import ExportGallery
+    from link_dialog import LinkDialog
+    from ui_style import BACKGROUND, L, M, S, XL, XS, apply_style, step_heading
+    from video_preview import VideoPreview
+except ImportError as _exc:
+    _GUI_IMPORT_ERROR: ImportError | None = _exc
+    tk = filedialog = messagebox = ttk = None  # type: ignore[assignment]
+else:
+    _GUI_IMPORT_ERROR = None
 
 
 APP_NAME = "Frame Cutter"
+MIN_PYTHON = (3, 11)
 LARGE_EXPORT_COUNT = 10_000
+SHORT_NAME_LENGTH = 42
+STARTUP_FAILED = ("Frame Cutter n’a pas pu démarrer à cause d’une erreur inattendue. "
+                  "Fermez cette fenêtre puis relancez « Lancer Frame Cutter ». "
+                  "Si le problème continue, réextrayez le dossier de Frame Cutter.")
 WORKSPACE_MAX_WIDTH = 1280
 FPS_MODE = "Images par seconde"
 INTERVAL_MODE = "Une image toutes les N secondes"
@@ -34,6 +48,31 @@ VIDEO_TYPES = [
     ("Vidéos", "*.mp4 *.mov *.mkv *.avi *.webm *.m4v *.mpeg *.mpg *.wmv *.ts"),
     ("Tous les fichiers", "*.*"),
 ]
+
+
+def _short_name(name: str) -> str:
+    return name if len(name) <= SHORT_NAME_LENGTH else f"{name[:27]}…{name[-12:]}"
+
+
+def _unexpected_error(task: str) -> FrameCutterError:
+    return FrameCutterError(f"Erreur inattendue pendant {task}. Réessayez ; si le problème continue, "
+                            "fermez puis relancez Frame Cutter.")
+
+
+def export_summary(folder: Path, count: int) -> str:
+    """The end-of-export status: the real number of images and the short folder name, never the full path."""
+    count_text = f"{count:,}".replace(",", "\u202f")
+    images = "image enregistrée" if count == 1 else "images enregistrées"
+    return f"Terminé : {count_text} {images} dans {_short_name(folder.name)}."
+
+
+def _count_images(folder: Path) -> int:
+    try:
+        with os.scandir(folder) as entries:
+            return sum(1 for entry in entries
+                       if entry.name.startswith("frame_") and entry.is_file(follow_symlinks=False))
+    except OSError:
+        return 0
 
 
 @dataclass(frozen=True)
@@ -69,9 +108,11 @@ class FrameCutterApp:
         self._operation_id = 0
         self._closing = False
         self.result_dir: Path | None = None
+        self._just_exported = False
         self._gallery_visible = False
 
         self._build_ui()
+        self._check_prerequisites()
         self.root.protocol("WM_DELETE_WINDOW", self._close)
         self._poll_job: str | None = self.root.after(100, self._poll_events)
 
@@ -81,6 +122,7 @@ class FrameCutterApp:
         self.header.pack(fill="x", padx=L, pady=(L, M))
         ttk.Label(self.header, text=APP_NAME, style="Title.TLabel").pack(anchor="w")
         ttk.Label(self.header, text="Transformez un passage vidéo en images.", style="Subtitle.TLabel").pack(anchor="w", pady=(XS, 0))
+        self.prerequisites_banner = ttk.Label(self.header, style="Warning.TLabel", wraplength=720, justify="left")
 
         self.dock = ttk.Frame(self.root, padding=(L, M))
         self.dock.pack(side="bottom", fill="x", padx=L, pady=(S, L))
@@ -126,6 +168,16 @@ class FrameCutterApp:
         self.fps.trace_add("write", lambda *_: self._update_estimate())
         self.interval_seconds.trace_add("write", lambda *_: self._update_estimate())
         self.sampling_mode.trace_add("write", lambda *_: self._update_estimate())
+
+    def _check_prerequisites(self) -> None:
+        """Announce a missing video component as soon as the window opens, not after choosing a video."""
+        try:
+            require_ffmpeg()
+        except FrameCutterError as exc:
+            message = " ".join(part.strip() for part in sanitize_user_error(str(exc)).splitlines() if part.strip())
+            self.prerequisites_banner.configure(text=message)
+            self.prerequisites_banner.pack(anchor="w", fill="x", pady=(M, 0))
+            self.status.set("Le composant vidéo est absent : suivez le message en haut de la fenêtre.")
 
     def _build_source(self, form: ttk.Frame) -> None:
         step_heading(form, "01", "Choisir la vidéo").pack(anchor="w")
@@ -294,7 +346,7 @@ class FrameCutterApp:
             self.events.put((operation_id, "error", exc))
         except Exception as exc:  # surface unexpected environment/decoder failures cleanly
             log_unexpected_error("analyse vidéo", exc)
-            self.events.put((operation_id, "error", FrameCutterError("Erreur inattendue pendant l’analyse de la vidéo.")))
+            self.events.put((operation_id, "error", _unexpected_error("l’analyse de la vidéo")))
 
     def _choose_link(self) -> None:
         if self.busy or self._closing:
@@ -341,7 +393,7 @@ class FrameCutterApp:
             self.events.put((operation_id, "error", exc))
         except Exception as exc:
             log_unexpected_error("import vidéo", exc)
-            self.events.put((operation_id, "error", FrameCutterError("Erreur inattendue pendant l’import vidéo.")))
+            self.events.put((operation_id, "error", _unexpected_error("l’import de la vidéo")))
         finally:
             if folder is not None:
                 remove_import_folder(folder)
@@ -370,7 +422,7 @@ class FrameCutterApp:
             self.events.put((operation_id, "error", exc))
         except Exception as exc:
             log_unexpected_error("enregistrement vidéo", exc)
-            self.events.put((operation_id, "error", FrameCutterError("Erreur inattendue pendant l’enregistrement vidéo.")))
+            self.events.put((operation_id, "error", _unexpected_error("l’enregistrement de la vidéo")))
         finally:
             if folder is not None:
                 remove_import_folder(folder)
@@ -391,8 +443,9 @@ class FrameCutterApp:
         self.video_info = info
         self.preview.set_source(path, info)
         dimensions = f"{info.width} × {info.height}" if info.width and info.height else "dimensions inconnues"
-        source_rate = f" · {info.frame_rate} im./s source" if info.frame_rate else ""
-        name = path.name if len(path.name) <= 42 else f"{path.name[:27]}…{path.name[-12:]}"
+        readable_rate = format_frame_rate(info.frame_rate)
+        source_rate = f" · {readable_rate}" if readable_rate else ""
+        name = _short_name(path.name)
         self.video_details.set(f"{name}\n{format_duration(info.duration)} · {dimensions}{source_rate}")
         destination = self.destination.get()
         if not destination.strip() or destination == self._suggested_destination:
@@ -506,7 +559,8 @@ class FrameCutterApp:
         entered_destination = self.destination.get().strip()
         destination = Path(entered_destination) if entered_destination else self._default_destination(self.video_path)
         if not destination.is_dir():
-            messagebox.showerror(APP_NAME, "Le dossier de destination n’existe pas.")
+            messagebox.showerror(APP_NAME, "Le dossier de destination n’existe pas : il a peut-être été déplacé ou "
+                                 "supprimé. Choisissez un autre dossier avec « Parcourir… ».", parent=self.root)
             return
         if self._import_folder is not None and destination.resolve().is_relative_to(
             self._import_folder
@@ -527,6 +581,7 @@ class FrameCutterApp:
 
     def _begin_operation(self) -> int:
         self._operation_id += 1
+        self._just_exported = False
         self.cancel_event.clear()
         self._set_busy_controls(True)
         return self._operation_id
@@ -543,12 +598,12 @@ class FrameCutterApp:
                 lambda n: self.events.put((operation_id, "progress", n)), self.cancel_event,
                 portions=portions, interval_seconds=interval_seconds,
             )
-            self.events.put((operation_id, "done", result))
+            self.events.put((operation_id, "done", (result, _count_images(result))))
         except FrameCutterError as exc:
             self.events.put((operation_id, "error", exc))
         except Exception as exc:
             log_unexpected_error("extraction des images", exc)
-            self.events.put((operation_id, "error", FrameCutterError("Erreur inattendue pendant l’extraction des images.")))
+            self.events.put((operation_id, "error", _unexpected_error("l’extraction des images")))
 
     def _cancel(self) -> None:
         if self.busy:
@@ -622,13 +677,20 @@ class FrameCutterApp:
                 elif kind == "saved":
                     assert isinstance(payload, Path)
                     self.progress.configure(value=100)
-                    self.status.set(f"Vidéo enregistrée : {payload}")
+                    # Names only: the full path of the user's folders never reaches the status bar.
+                    folder = _short_name(payload.parent.name) if payload.parent.name else "choisi"
+                    self.status.set(
+                        f"Copie enregistrée : « {_short_name(payload.name)} » dans le dossier « {folder} ». "
+                        "Elle n’est pas ouverte ici : utilisez « Ouvrir un fichier vidéo… » pour la traiter."
+                    )
                     self._set_busy_controls(False)
                 elif kind == "done":
-                    assert isinstance(payload, Path)
-                    self.result_dir = payload
+                    result, count = payload
+                    assert isinstance(result, Path)
+                    self.result_dir = result
+                    self._just_exported = True
                     self.progress.configure(value=100)
-                    self.status.set("Export terminé. Les images sont disponibles dans la galerie.")
+                    self.status.set(export_summary(result, count))
                     self._set_busy_controls(False)
                     self._show_gallery(reveal=False)
                 elif kind == "error":
@@ -674,7 +736,10 @@ class FrameCutterApp:
         self.destination_button.configure(state="disabled" if busy else "normal")
         self.cancel_button.configure(state="normal" if busy else "disabled")
         result_state = "normal" if not busy and self.result_dir is not None else "disabled"
-        self.open_button.configure(state=result_state)
+        # Once an export is finished, « Ouvrir le dossier » becomes the main action of the window.
+        show_result = not busy and self._just_exported and self.result_dir is not None
+        self.start_button.configure(style="TButton" if show_result else "Primary.TButton")
+        self.open_button.configure(state=result_state, style="Primary.TButton" if show_result else "Quiet.TButton")
         self.gallery_button.configure(state=result_state)
         self._update_estimate()
         self._update_media()
@@ -715,14 +780,23 @@ class FrameCutterApp:
 
     def _open_result(self) -> None:
         result_dir = self.result_dir
-        if not result_dir or not result_dir.is_dir():
+        if not result_dir:
+            return
+        if not result_dir.is_dir():
+            messagebox.showerror(
+                APP_NAME,
+                f"Le dossier de résultats « {_short_name(result_dir.name)} » est introuvable : il a été déplacé ou "
+                "supprimé. Cherchez-le dans l’Explorateur Windows, ou relancez l’extraction.",
+                parent=self.root,
+            )
             return
         try:
             subprocess.Popen([_resolve_explorer_executable(), str(result_dir.resolve())])
         except OSError:
             messagebox.showerror(
                 APP_NAME,
-                "Impossible d’ouvrir le dossier de résultats dans l’Explorateur Windows.",
+                "Impossible d’ouvrir le dossier de résultats dans l’Explorateur Windows. "
+                "Réessayez, ou ouvrez-le vous-même depuis l’Explorateur.",
                 parent=self.root,
             )
 
@@ -731,19 +805,79 @@ def _resolve_explorer_executable() -> str:
     return str(Path(os.environ.get("SystemRoot", r"C:\Windows")) / "explorer.exe")
 
 
-def main() -> None:
+def startup_problem(version_info: tuple[int, ...] | None = None,
+                    gui_error: ImportError | None = None) -> str | None:
+    """Explain, before any window, why Frame Cutter cannot start. None when it can."""
+    version_info = tuple(sys.version_info[:3] if version_info is None else version_info)
+    if version_info[:2] < MIN_PYTHON:
+        shown = ".".join(str(part) for part in version_info[:2])
+        return (f"Frame Cutter nécessite Python 3.11 ou plus récent (version trouvée : {shown}). "
+                "Installez Python depuis https://www.python.org/downloads/windows/, puis relancez Frame Cutter.")
+    if gui_error is not None:
+        if (getattr(gui_error, "name", None) or "").lstrip("_") == "tkinter":
+            return ("Le module d’interface Tkinter manque dans Python. Relancez l’installation de Python, choisissez "
+                    "« Modify » et cochez « tcl/tk and IDLE », puis relancez Frame Cutter.")
+        return ("Un fichier de Frame Cutter est manquant ou abîmé. Réextrayez le dossier complet de Frame Cutter, "
+                "puis relancez l’application.")
+    return None
+
+
+def _show_startup_error(message: str) -> None:
+    """Show a startup problem in a window when possible, and always in the console."""
+    if sys.stderr is not None:
+        try:
+            print(f"{APP_NAME} : {message}", file=sys.stderr)
+        except (OSError, ValueError):
+            pass
+    if tk is not None:
+        try:
+            root = tk.Tk()
+            root.withdraw()
+            try:
+                messagebox.showerror(APP_NAME, message, parent=root)
+            finally:
+                root.destroy()
+            return
+        except Exception:  # noqa: BLE001 - the console message above is the fallback.
+            pass
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            ctypes.windll.user32.MessageBoxW(None, message, APP_NAME, 0x10)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def main() -> int:
     # Unexpected errors go to stderr, already stripped of personal paths by log_unexpected_error.
     logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    clean_abandoned_imports()
-    if os.name == "nt" and getattr(sys, "frozen", False):
-        import ctypes
+    problem = startup_problem(gui_error=_GUI_IMPORT_ERROR)
+    if problem is not None:
+        _show_startup_error(problem)
+        return 1
+    root = None
+    try:
+        clean_abandoned_imports()
+        if os.name == "nt" and getattr(sys, "frozen", False):
+            import ctypes
 
-        # The bundled helpers load their own DLLs instead of the frozen Python libraries.
-        ctypes.windll.kernel32.SetDllDirectoryW(None)
-    root = tk.Tk()
-    FrameCutterApp(root)
+            # The bundled helpers load their own DLLs instead of the frozen Python libraries.
+            ctypes.windll.kernel32.SetDllDirectoryW(None)
+        root = tk.Tk()
+        FrameCutterApp(root)
+    except Exception as exc:  # noqa: BLE001 - nothing may escape as a raw traceback before the window opens.
+        log_unexpected_error("démarrage", exc)
+        if root is not None:
+            try:
+                root.destroy()
+            except tk.TclError:
+                pass
+        _show_startup_error(STARTUP_FAILED)
+        return 1
     root.mainloop()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

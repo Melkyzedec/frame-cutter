@@ -14,6 +14,7 @@ import traceback
 from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
 from typing import Callable, Iterator, Sequence
 
@@ -62,22 +63,28 @@ _FFMPEG_ERROR_TABLE = (
     (
         "format not on whitelist",
         {
-            "probe": "Impossible de lire cette vidéo : format de fichier non pris en charge (not on whitelist).",
-            "extract": "L’extraction a échoué : format de fichier non pris en charge (not on whitelist).",
+            "probe": "Impossible de lire cette vidéo : format de fichier non pris en charge. "
+                     "Choisissez une vidéo MP4, MOV, MKV, WebM ou AVI.",
+            "extract": "L’extraction a échoué : format de fichier non pris en charge. "
+                       "Choisissez une vidéo MP4, MOV, MKV, WebM ou AVI.",
         },
     ),
     (
         "not on whitelist",
         {
-            "probe": "Impossible de lire cette vidéo : protocole externe non autorisé (not on whitelist).",
-            "extract": "L’extraction a échoué : protocole externe non autorisé (not on whitelist).",
+            "probe": "Impossible de lire cette vidéo : le fichier renvoie vers une source externe non prise en charge, "
+                     "bloquée par sécurité. Ouvrez directement le fichier vidéo.",
+            "extract": "L’extraction a échoué : le fichier renvoie vers une source externe non prise en charge, "
+                       "bloquée par sécurité. Ouvrez directement le fichier vidéo.",
         },
     ),
     (
         "permission denied",
         {
-            "probe": "Impossible de lire cette vidéo : accès au fichier refusé.",
-            "extract": "L’extraction a échoué : accès au fichier ou au dossier refusé.",
+            "probe": "Impossible de lire cette vidéo : accès au fichier refusé. "
+                     "Copiez la vidéo dans un dossier personnel, par exemple Vidéos, puis réessayez.",
+            "extract": "L’extraction a échoué : accès au fichier ou au dossier refusé. "
+                       "Choisissez un autre dossier de sortie.",
         },
     ),
 )
@@ -184,22 +191,19 @@ def _find_binary(name: str) -> str | None:
     return find_executable(name)
 
 
+VIDEO_COMPONENT_MISSING = (
+    "Le composant vidéo est absent : Frame Cutter ne peut pas lire de vidéo.\n\n"
+    "Téléchargez FFmpeg gratuitement sur https://ffmpeg.org/download.html et copiez tout le contenu "
+    "de son dossier « bin » dans le dossier tools\\ffmpeg\\bin de Frame Cutter, puis relancez l’application."
+)
+
+
 def require_ffmpeg() -> tuple[str, str]:
     ffmpeg = _find_binary("ffmpeg")
     ffprobe = _find_binary("ffprobe")
     if ffmpeg and ffprobe:
         return ffmpeg, ffprobe
-    missing = []
-    if not ffmpeg:
-        missing.append("ffmpeg.exe")
-    if not ffprobe:
-        missing.append("ffprobe.exe")
-    raise FrameCutterError(
-        "Le moteur vidéo FFmpeg est introuvable (" + ", ".join(missing) + ").\n\n"
-        "Ajoutez ffmpeg.exe et ffprobe.exe dans le dossier tools\\ffmpeg\\bin "
-        "à côté de l’application, ou installez FFmpeg et ajoutez-le au PATH. "
-        "Téléchargement gratuit : https://ffmpeg.org/download.html"
-    )
+    raise FrameCutterError(VIDEO_COMPONENT_MISSING)
 
 
 @contextmanager
@@ -260,7 +264,8 @@ def probe_video(path: Path, cancel_event: threading.Event | None = None) -> Vide
     except subprocess.TimeoutExpired as exc:
         raise FrameCutterError("La lecture des informations de la vidéo a dépassé 30 secondes.") from exc
     except OSError as exc:
-        raise FrameCutterError("Impossible de lancer l’outil d’analyse vidéo (ffprobe).") from exc
+        raise FrameCutterError("Impossible de lancer l’outil d’analyse vidéo. "
+                               "Réinstallez le composant vidéo, puis réessayez.") from exc
 
     if cancel_event is not None and cancel_event.is_set():
         raise OperationCancelled("Analyse annulée.")
@@ -329,12 +334,27 @@ def read_preview_frame(
     except subprocess.TimeoutExpired as exc:
         raise FrameCutterError("La lecture de l’aperçu a dépassé 10 secondes.") from exc
     except OSError as exc:
-        raise FrameCutterError("Impossible de lancer l’aperçu vidéo.") from exc
+        raise FrameCutterError("Impossible de lancer l’aperçu vidéo. "
+                               "Réinstallez le composant vidéo, puis rouvrez la vidéo.") from exc
     if cancel_event.is_set():
         raise OperationCancelled("Aperçu annulé.")
     if return_code != 0 or not image.startswith(b"\x89PNG\r\n\x1a\n"):
         raise FrameCutterError("Aucune image disponible à cette position.")
     return image
+
+
+def format_frame_rate(rate: str | None) -> str | None:
+    """Turn a raw rate ("25/1", "30000/1001") into "25 images/s" or "29,97 images/s"."""
+    if not rate or len(rate) > 32:
+        return None
+    try:
+        value = Fraction(rate.strip())
+    except (ValueError, ZeroDivisionError, OverflowError):
+        return None
+    if not 0 < value <= 10_000:
+        return None
+    number = f"{float(value):.2f}".rstrip("0").rstrip(".").replace(".", ",")
+    return f"{number} images/s"
 
 
 def format_duration(seconds: float) -> str:
@@ -437,7 +457,8 @@ def extract_frames(
     if not source.is_file():
         raise FrameCutterError("Le fichier vidéo sélectionné n’existe plus.")
     if not destination_parent.is_dir():
-        raise FrameCutterError("Le dossier de destination n’existe pas ou n’est pas accessible.")
+        raise FrameCutterError("Le dossier de destination n’existe pas ou n’est pas accessible. "
+                               "Choisissez un autre dossier.")
     try:
         source = source.resolve(strict=True)
         destination_parent = destination_parent.resolve(strict=True)
@@ -540,7 +561,8 @@ def _extract_portion(
             return_code = process.wait()
             stderr_thread.join()
     except OSError as exc:
-        raise FrameCutterError("Impossible d’exécuter FFmpeg.", output_dir) from exc
+        raise FrameCutterError("Impossible de lancer le composant vidéo pour l’extraction. "
+                               "Réinstallez-le, puis réessayez.", output_dir) from exc
 
     if cancel_event.is_set():
         raise OperationCancelled("Extraction annulée. Les images déjà créées sont conservées.", output_dir)

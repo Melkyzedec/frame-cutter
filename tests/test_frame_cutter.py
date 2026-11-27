@@ -183,10 +183,13 @@ class FrameCutterTests(unittest.TestCase):
             "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2,\n"
             "http://127.0.0.1:9/external.ts\n#EXT-X-ENDLIST\n", encoding="ascii",
         )
-        with self.assertRaisesRegex(FrameCutterError, "not on whitelist"):
+        # Blocage inchangé ; seul le libellé est désormais en français clair, sans « whitelist ».
+        with self.assertRaisesRegex(FrameCutterError, "non prise? en charge") as ctx:
             probe_video(manifest)
-        with self.assertRaisesRegex(FrameCutterError, "not on whitelist"):
+        self.assertNotIn("whitelist", str(ctx.exception))
+        with self.assertRaisesRegex(FrameCutterError, "non prise? en charge") as ctx:
             extract_frames(manifest, self.destination, 5, "JPEG", 2, lambda _: None, threading.Event())
+        self.assertNotIn("whitelist", str(ctx.exception))
         with self.assertRaisesRegex(FrameCutterError, "Aucune image disponible"):
             read_preview_frame(manifest, 0, 160, 90, threading.Event())
 
@@ -634,7 +637,9 @@ class FrameCutterTests(unittest.TestCase):
         [saved] = list(save_to.glob("*.mp4"))
         self.assertEqual(saved.read_bytes(), data)
         self.assertEqual(app.video_path, self.source)
-        self.assertIn(str(saved), app.status.get())
+        # Nom court seulement : le chemin complet du dossier n’apparaît plus dans la barre d’état.
+        self.assertIn(saved.name, app.status.get())
+        self.assertNotIn(str(save_to), app.status.get())
         self.destroy_window(app)
         self.assertTrue(saved.is_file())
         streams = subprocess.run(
@@ -1035,8 +1040,8 @@ class ReleaseHardeningTests(unittest.TestCase):
         # qui contient le chemin réel et un chemin Windows fictif.
         branches = (
             ("No space left on device", "Espace disque insuffisant", "Espace disque insuffisant"),
-            ("Protocol 'http' not on whitelist 'file'!", "protocole externe non autorisé",
-             "protocole externe non autorisé"),
+            ("Protocol 'http' not on whitelist 'file'!", "source externe non prise en charge",
+             "source externe non prise en charge"),
             ("Format not on whitelist 'mov,matroska'", "format de fichier non pris en charge",
              "format de fichier non pris en charge"),
             ("Permission denied", "accès au fichier refusé", "accès au fichier ou au dossier refusé"),
@@ -1091,7 +1096,7 @@ class ReleaseHardeningTests(unittest.TestCase):
                     (lambda: probe_video(source), "Impossible de lancer l’outil d’analyse"),
                     (lambda: read_preview_frame(source, 1.0, 160, 90, threading.Event()), "Impossible de lancer l’aperçu"),
                     (lambda: extract_frames(source, destination, 5, "JPEG", 2.0, lambda _: None, threading.Event()),
-                     "Impossible d’exécuter FFmpeg"),
+                     "Impossible de lancer le composant vidéo"),
                 ):
                     with self.subTest(launch=message), patch("frame_engine.subprocess.Popen", side_effect=launch_failure):
                         with self.assertRaisesRegex(FrameCutterError, message) as ctx:
