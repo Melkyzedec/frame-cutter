@@ -44,6 +44,19 @@ IMPORT_FOLDER = re.compile(r"frame-cutter-v2-[0-9a-f]{32}")
 IMPORT_MARKER = ".frame-cutter-import"
 IMPORT_MARKER_CONTENT = b"Frame Cutter temporary import v2\n"
 _active_imports: dict[Path, BinaryIO] = {}
+NETWORK_FAILURE = "Connexion impossible ou interrompue. Vérifiez votre accès Internet puis réessayez."
+ADVANCED_SETUP = "Suivez la section « Import depuis un lien (avancé) » du mode d’emploi, puis relancez Frame Cutter."
+NODE_MISSING = ("L’import YouTube nécessite Node.js 22 ou plus récent. Installez-le depuis https://nodejs.org "
+                "avec les options proposées, puis relancez Frame Cutter.")
+# Lower-case fragments of yt-dlp output that mean the network, not the video, is at fault.
+_NETWORK_FAILURE_MARKERS = (
+    "unable to download webpage", "unable to download api page", "failed to resolve", "getaddrinfo failed",
+    "name or service not known", "temporary failure in name resolution", "nodename nor servname",
+    "no address associated with hostname", "connection refused", "connection reset", "connection aborted",
+    "remote end closed connection", "network is unreachable", "no route to host", "timed out",
+    "errno 11001", "errno 11002", "winerror 10051", "winerror 10053", "winerror 10054", "winerror 10060",
+    "winerror 10061", "winerror 10065",
+)
 
 if os.name == "nt":
     import msvcrt
@@ -348,8 +361,80 @@ def _require_pinned_yt_dlp(found: str | None) -> None:
     if found == YT_DLP_VERSION:
         return
     shown = found if found and _SHOWN_VERSION_RE.fullmatch(found) else "inconnue"
-    raise FrameCutterError(f"Le composant d’import yt-dlp est en version {shown}, alors que la version attendue "
-                           f"({YT_DLP_VERSION}) est requise. Réinstallez les composants d’import indiqués dans le README.")
+    raise FrameCutterError(f"Le composant d’import des liens YouTube et Instagram est en version {shown}, alors que "
+                           f"la version attendue ({YT_DLP_VERSION}) est requise. Réinstallez-le. {ADVANCED_SETUP}")
+
+
+def _platform_downloader(youtube: bool) -> tuple[list[str], dict[str, str]]:
+    """Return the pinned yt-dlp command and its environment, or explain what is missing."""
+    if sys.version_info < (3, 11):
+        raise FrameCutterError("L’import YouTube et Instagram nécessite Python 3.11 ou plus récent. "
+                               "Installez une version récente de Python, puis relancez Frame Cutter.")
+    env = os.environ.copy()
+    if getattr(sys, "frozen", False):
+        downloader = IMPORT_TOOLS / "yt-dlp.exe"
+        if not downloader.is_file():
+            raise FrameCutterError("Le composant d’import est absent. Réextrayez l’archive de Frame Cutter.")
+        _require_pinned_yt_dlp(_frozen_yt_dlp_version(downloader))
+        return [str(downloader)], env
+    modules = ("yt_dlp", "yt_dlp_ejs") if youtube else ("yt_dlp",)
+    if all((IMPORT_TOOLS / name / "__init__.py").is_file() for name in modules):
+        env["PYTHONPATH"] = str(IMPORT_TOOLS)
+        package_dir = IMPORT_TOOLS / "yt_dlp"
+    elif not all(find_spec(name) is not None for name in modules):
+        raise FrameCutterError("Le composant d’import des liens YouTube et Instagram n’est pas installé. "
+                               + ADVANCED_SETUP)
+    else:
+        locations = list(getattr(find_spec("yt_dlp"), "submodule_search_locations", None) or [])
+        package_dir = Path(locations[0]) if locations else None
+    _require_pinned_yt_dlp(_source_yt_dlp_version(package_dir))
+    # -P: the import folder used as cwd must not be added to sys.path.
+    return [sys.executable, "-B", "-P", "-m", "yt_dlp"], env
+
+
+def _node_runtime() -> str | None:
+    bundled_node = IMPORT_TOOLS / "node.exe"
+    return str(bundled_node) if bundled_node.is_file() else find_executable("node")
+
+
+def platform_problems() -> dict[str, str | None]:
+    """Say, for each platform, why its links cannot be imported (None: usable).
+
+    Only files are inspected (and the bundled downloader asked for its version in the frozen build):
+    nothing is downloaded and no link is opened.
+    """
+    checked: dict[bool | None, str | None] = {}
+
+    def downloader_problem(youtube: bool) -> str | None:
+        # The frozen build has a single downloader for both platforms: ask its version only once.
+        key = None if getattr(sys, "frozen", False) else youtube
+        if key not in checked:
+            try:
+                _platform_downloader(youtube)
+                checked[key] = None
+            except FrameCutterError as exc:
+                checked[key] = str(exc)
+        return checked[key]
+
+    youtube = downloader_problem(True)
+    if youtube is None and _node_runtime() is None:
+        youtube = NODE_MISSING
+    return {"youtube": youtube, "instagram": downloader_problem(False)}
+
+
+def is_youtube_link(text: str) -> bool:
+    """True when the text looks like a YouTube address (the link itself is checked on import)."""
+    try:
+        host = (urlsplit(text.strip()).hostname or "").rstrip(".").lower()
+    except ValueError:
+        return False
+    return host in YOUTUBE_HOSTS
+
+
+def _is_network_failure(output: str) -> bool:
+    if "http error" in output:
+        return False
+    return any(marker in output for marker in _NETWORK_FAILURE_MARKERS)
 
 
 def _download_platform(
@@ -357,29 +442,7 @@ def _download_platform(
 ) -> Path:
     youtube = link.platform == "youtube"
     platform_name = "YouTube" if youtube else "Instagram"
-    if sys.version_info < (3, 11):
-        raise FrameCutterError(f"L’import {platform_name} nécessite Python 3.11 ou plus récent.")
-    env = os.environ.copy()
-    if getattr(sys, "frozen", False):
-        downloader = IMPORT_TOOLS / "yt-dlp.exe"
-        if not downloader.is_file():
-            raise FrameCutterError("Le composant d’import est absent. Réextrayez l’archive de Frame Cutter.")
-        _require_pinned_yt_dlp(_frozen_yt_dlp_version(downloader))
-        command = [str(downloader)]
-    else:
-        modules = ("yt_dlp", "yt_dlp_ejs") if youtube else ("yt_dlp",)
-        if all((IMPORT_TOOLS / name / "__init__.py").is_file() for name in modules):
-            env["PYTHONPATH"] = str(IMPORT_TOOLS)
-            package_dir = IMPORT_TOOLS / "yt_dlp"
-        elif not all(find_spec(name) is not None for name in modules):
-            raise FrameCutterError(f"Le composant d’import {platform_name} est absent. "
-                                   "Installez les dépendances indiquées dans le README.")
-        else:
-            locations = list(getattr(find_spec("yt_dlp"), "submodule_search_locations", None) or [])
-            package_dir = Path(locations[0]) if locations else None
-        _require_pinned_yt_dlp(_source_yt_dlp_version(package_dir))
-        # -P: the import folder used as cwd must not be added to sys.path.
-        command = [sys.executable, "-B", "-P", "-m", "yt_dlp"]
+    command, env = _platform_downloader(youtube)
     ffmpeg, _ = require_ffmpeg()
     name = f"{link.platform}-{link.video_id}" + ("-extrait" if link.portion else "")
     path = folder / f"{name}.mp4"
@@ -395,10 +458,9 @@ def _download_platform(
     if preserve_audio:
         command += ["--merge-output-format", "mkv", "--remux-video", "mkv"]
     if youtube:
-        bundled_node = IMPORT_TOOLS / "node.exe"
-        node = str(bundled_node) if bundled_node.is_file() else find_executable("node")
+        node = _node_runtime()
         if node is None:
-            raise FrameCutterError("L’import YouTube nécessite Node.js 22 ou plus récent dans le PATH.")
+            raise FrameCutterError(NODE_MISSING)
         match_filter = "!is_live & !is_upcoming"
         if link.portion is not None:
             start, end = link.portion
@@ -438,10 +500,23 @@ def _download_platform(
                                                "rate-limit reached", "log in", "login_required")):
         raise FrameCutterError(f"{platform_name} a bloqué cet import ou demande une connexion. "
                                "Réessayez plus tard ou ouvrez un fichier local.")
+    if _is_network_failure(failure):
+        raise FrameCutterError(NETWORK_FAILURE)
     if not youtube:
         raise FrameCutterError("Impossible d’importer ce Reel Instagram. Vérifiez qu’il est public et lisible sans connexion.")
     raise FrameCutterError("Impossible d’importer cette vidéo YouTube. Vérifiez que la vidéo est publique, "
                            "que le direct est terminé et que les bornes sont dans sa durée.")
+
+
+def _refusal_message(code: int) -> str:
+    if code in (404, 410):
+        return "Cette vidéo est introuvable à cette adresse. Vérifiez le lien dans votre navigateur, puis réessayez."
+    if code in (401, 403, 407):
+        return ("Le site refuse de fournir cette vidéo : elle est privée ou protégée. "
+                "Vérifiez le lien, ou ouvrez une copie enregistrée sur votre PC.")
+    if code == 429:
+        return "Le site limite les téléchargements pour le moment. Réessayez dans quelques minutes."
+    return "Le site de la vidéo ne répond pas correctement pour le moment. Réessayez plus tard."
 
 
 def download_video(
@@ -455,14 +530,14 @@ def download_video(
                 else _download_direct(link.url, folder, cancel, deadline))
     except HTTPError as exc:
         _check_interrupt(cancel, deadline)
-        raise FrameCutterError(f"Le serveur refuse l’accès à la vidéo (HTTP {exc.code}).") from None
+        raise FrameCutterError(_refusal_message(exc.code)) from None
     except UnicodeError:
         _check_interrupt(cancel, deadline)
         raise FrameCutterError("L’adresse du lien contient des caractères non pris en charge. "
                                "Vérifiez le lien ou ouvrez la vidéo comme fichier local.") from None
     except (URLError, TimeoutError):
         _check_interrupt(cancel, deadline)
-        raise FrameCutterError("Le serveur vidéo est injoignable ou le téléchargement a expiré.") from None
+        raise FrameCutterError(NETWORK_FAILURE) from None
     except (HTTPException, ConnectionError):
         _check_interrupt(cancel, deadline)
         raise FrameCutterError("Le téléchargement a été interrompu. Réessayez.") from None

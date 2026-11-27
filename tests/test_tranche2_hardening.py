@@ -364,7 +364,7 @@ class ExecutableLookupTests(unittest.TestCase):
         for path_value in (os.curdir, "", os.pathsep.join([os.curdir, ""]), str(self.trusted)):
             with self.subTest(PATH=path_value), patch.dict(os.environ, {"PATH": path_value}):
                 self.assertIsNone(_find_binary("ffmpeg"))
-                with self.assertRaisesRegex(FrameCutterError, "FFmpeg est introuvable"):
+                with self.assertRaisesRegex(FrameCutterError, "composant vidéo est absent"):
                     require_ffmpeg()
 
     def test_absolute_path_entries_are_used_and_returned_absolute(self):

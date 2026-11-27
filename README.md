@@ -2,30 +2,17 @@
 
 Petite application Windows locale pour extraire des images d’une vidéo à une cadence choisie. La valeur initiale est de 5 images par seconde. Les images sont écrites dans un nouveau dossier à côté de la vidéo, ou dans le dossier parent choisi.
 
-## Prérequis sous Windows
+## Démarrer en 3 étapes
 
-- Windows 10 ou 11 et Python 3.14 avec Tkinter. [Télécharger Python pour Windows](https://www.python.org/downloads/windows/).
-- Une distribution Windows de FFmpeg qui fournit `ffmpeg.exe` et `ffprobe.exe`. Placez le dossier `bin` dans le `PATH`, ou copiez ces exécutables et les DLL qui les accompagnent dans `tools/ffmpeg/bin` à côté de `app.py`. [Télécharger FFmpeg pour Windows](https://ffmpeg.org/download.html#build-windows).
+1. **Installer Python 3.11 ou plus récent** (environ 2 minutes). [Télécharger Python pour Windows](https://www.python.org/downloads/windows/), lancez l’installation et gardez les options proposées.
+2. **Ajouter le composant vidéo FFmpeg** (environ 2 minutes). [Télécharger FFmpeg pour Windows](https://ffmpeg.org/download.html#build-windows), décompressez l’archive, puis copiez tout le contenu de son dossier `bin` dans le dossier `tools\ffmpeg\bin` de Frame Cutter (créez ce dossier s’il n’existe pas).
+3. **Double-cliquez sur `Lancer Frame Cutter.bat`.** La fenêtre s’ouvre. S’il manque quelque chose, un message en français indique la cause et l’action à faire, puis attend que vous l’ayez lu.
 
-Dans PowerShell, ouvrez le dossier qui contient `app.py` et lancez `python -m tkinter`. Une fenêtre de démonstration doit s’ouvrir. Fermez-la pour continuer.
-
-## Lancement
-
-Dans le même dossier PowerShell, lancez l’application.
-
-```powershell
-python app.py
-```
+Si le composant vidéo est absent, Frame Cutter l’annonce en haut de la fenêtre dès l’ouverture.
 
 ## Premier essai
 
-Pour essayer avec une vidéo synthétique, lancez cette commande avant d’ouvrir l’application. Si FFmpeg est dans `tools/ffmpeg/bin`, commencez la commande par `& .\tools\ffmpeg\bin\ffmpeg.exe` à la place de `ffmpeg`. L’option `-n` préserve un fichier d’essai déjà présent.
-
-```powershell
-ffmpeg -n -f lavfi -i "testsrc2=size=160x90:rate=25" -t 20 -c:v mpeg4 essai.mp4
-```
-
-Dans Frame Cutter, ouvrez `essai.mp4`. Gardez la vidéo entière, choisissez **Une image toutes les N secondes**, saisissez **5** dans **Secondes entre les images**, sélectionnez **PNG**, puis cliquez sur **Extraire les images**. Le dossier `essai_frames` contient quatre images, de `frame_000001.png` à `frame_000004.png`. Si ce dossier existe déjà, regardez le nouveau dossier numéroté affiché par l’application.
+Ouvrez une courte vidéo MP4 avec **Ouvrir un fichier vidéo…**. Gardez la vidéo entière, choisissez **Une image toutes les N secondes**, saisissez **5** dans **Secondes entre les images**, sélectionnez **PNG**, puis cliquez sur **Extraire les images**. À la fin, la barre d’état indique le nombre d’images enregistrées et le nom du dossier créé, par exemple « Terminé : 4 images enregistrées dans essai_frames. ». Cliquez sur **Ouvrir le dossier** pour retrouver les images.
 
 ## Utilisation
 
@@ -54,29 +41,40 @@ Le moteur sélectionne des images existantes à intervalle régulier. Il ne cré
 
 Importez uniquement des vidéos que vous avez le droit de télécharger et de traiter. Pour un lien de plateforme, vérifiez aussi que le mode d’accès et de téléchargement est autorisé par le service. Une vidéo visible publiquement peut être soumise à ces restrictions. Si vous disposez déjà d’une copie obtenue par un moyen autorisé, ouvrez le fichier local. [Conditions YouTube](https://www.youtube.com/t/terms) · [Conditions Instagram](https://help.instagram.com/581066165581870/)
 
+YouTube et Instagram demandent des composants supplémentaires, décrits dans la section [Import depuis un lien (avancé)](#import-depuis-un-lien-avancé). Sans eux, la boîte d’import ne propose que les liens directs et explique pourquoi les plateformes sont indisponibles.
+
 - **YouTube** accepte les liens de vidéos publiques et de Shorts lisibles sans connexion. Renseignez les deux bornes pour demander un seul extrait ou laissez-les vides pour importer la vidéo. Après l’import d’un extrait, le curseur démarre à **00:00** au début de celui-ci. Des données proches des bornes peuvent être nécessaires au décodage.
 - **Instagram** accepte les liens `/reel/…` publics accessibles sans connexion. Frame Cutter récupère le Reel entier, puis vous choisissez les passages dans l’aperçu.
 - **Fichier direct en HTTPS** accepte par exemple un MP4 ou un WebM hébergé sur un site. Le fichier entier est récupéré, puis vous choisissez vos passages dans Frame Cutter.
 
-La vidéo importée est stockée dans un dossier temporaire. Les imports sont limités à 1 Go et s’arrêtent si l’espace libre descend sous 512 Mo. Le téléchargement depuis un lien direct utilise une connexion HTTPS publique, y compris après une redirection. Si tu utilises un serveur privé ou un réseau qui impose un proxy, ouvre la vidéo comme fichier local.
+La vidéo importée est stockée dans un dossier temporaire. Les imports sont limités à 1 Go et s’arrêtent si l’espace libre descend sous 512 Mo. Le téléchargement depuis un lien direct utilise une connexion HTTPS publique, y compris après une redirection. Si vous utilisez un serveur privé ou un réseau qui impose un proxy, ouvrez la vidéo comme fichier local. En cas de coupure réseau, Frame Cutter affiche « Connexion impossible ou interrompue. Vérifiez votre accès Internet puis réessayez. ».
 
 Frame Cutter nettoie ses dossiers temporaires quand on change de source ou qu’on ferme l’application. Au redémarrage, il efface aussi les dossiers d’import qu’il a créés depuis cette version et qui ne sont plus utilisés. Les images restent dans le dossier de sortie sélectionné.
 
-### Enregistrer une copie
+### Enregistrer sans ouvrir
 
-Dans la boîte d’import, **Enregistrer une copie…** demande un dossier. Frame Cutter réutilise le téléchargement et la validation vidéo, prépare la copie sous un nom temporaire puis la renomme une fois vérifiée. Un fichier déjà présent n’est jamais remplacé : un suffixe numérique est ajouté. Le chemin final apparaît dans la barre d’état et le fichier reste disponible après la fermeture de l’application. Pour une plateforme, l’enregistrement demande les pistes audio disponibles et les remuxe en MKV.
+Dans la boîte d’import, **Importer** ouvre la vidéo dans Frame Cutter. **Enregistrer sans ouvrir…** garde seulement une copie : il demande un dossier, mais n’ouvre pas la vidéo dans la fenêtre. Frame Cutter réutilise le téléchargement et la validation vidéo, prépare la copie sous un nom temporaire puis la renomme une fois vérifiée. Un fichier déjà présent n’est jamais remplacé : un suffixe numérique est ajouté. La barre d’état indique le nom du fichier et celui de son dossier, et le fichier reste disponible après la fermeture de l’application. Pour le traiter, ouvrez-le ensuite avec **Ouvrir un fichier vidéo…**. Pour une plateforme, l’enregistrement demande les pistes audio disponibles et les remuxe en MKV.
 
-### Composants pour YouTube et Instagram
+## Import depuis un lien (avancé)
 
-L’import de liens YouTube ou Instagram demande les composants Python ci-dessous. Pour YouTube, ajoutez également Node.js 22 ou plus récent au `PATH`. [Télécharger Node.js pour Windows](https://nodejs.org/en/download).
+Cette section n’est utile que pour importer des liens YouTube ou Instagram. Les fichiers locaux et les liens directs fonctionnent sans elle.
 
-Installez les composants d’import dans le projet depuis PowerShell :
+1. Pour YouTube, installez Node.js 22 ou plus récent avec les options proposées. [Télécharger Node.js pour Windows](https://nodejs.org/en/download). Le programme d’installation l’ajoute au `PATH`.
+2. Dans PowerShell, ouvrez le dossier qui contient `app.py` et installez les composants d’import dans le projet :
 
 ```powershell
-python -m pip install --target tools/link-import -r requirements-import.txt
+py -3 -m pip install --target tools/link-import -r requirements-import.txt
 ```
 
-Les fichiers directs et l’ouverture locale sont disponibles sans ces composants. Si une plateforme bloque un lien, Frame Cutter affiche l’erreur et permet de réessayer ou d’ouvrir un fichier local.
+La version de `yt-dlp` est épinglée et vérifiée par empreinte. Frame Cutter refuse toute autre version et l’indique dans la boîte d’import. Relancez ensuite `Lancer Frame Cutter.bat`. Si une plateforme bloque un lien, Frame Cutter affiche l’erreur et permet de réessayer ou d’ouvrir un fichier local.
+
+### Lancement manuel et vidéo d’essai
+
+Le lanceur équivaut à `py -3 app.py` dans le dossier de Frame Cutter. Si FFmpeg est déjà dans le `PATH`, il est utilisé quand `tools\ffmpeg\bin` est vide. Pour créer une vidéo synthétique d’essai, lancez dans PowerShell (l’option `-n` préserve un fichier déjà présent) :
+
+```powershell
+& .\tools\ffmpeg\bin\ffmpeg.exe -n -f lavfi -i "testsrc2=size=160x90:rate=25" -t 20 -c:v mpeg4 essai.mp4
+```
 
 ## Limites connues
 

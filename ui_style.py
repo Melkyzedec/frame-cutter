@@ -66,6 +66,8 @@ def apply_style(root: tk.Tk) -> None:
     style.configure("Control.TLabel", font=ACTION)
     style.configure("Timecode.TLabel", font=TIMECODE, foreground=INK)
     style.configure("Meta.TLabel", foreground=MUTED, font=META)
+    style.configure("Warning.TLabel", background=SURFACE, foreground=INK, font=BODY, padding=(M, S),
+                    bordercolor=ACCENT, relief="solid", borderwidth=1)
 
     style.configure("TButton", font=ACTION, padding=(M, S), background=SURFACE, borderwidth=1,
                     bordercolor=MUTED, relief="solid", lightcolor=MUTED, darkcolor=MUTED, focusthickness=1)
