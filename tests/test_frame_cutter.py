@@ -13,8 +13,10 @@ import unittest
 from http.client import IncompleteRead
 from io import BytesIO
 from pathlib import Path
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import patch
+import frame_engine
 from uuid import uuid4
 
 import app as app_module
@@ -120,14 +122,19 @@ class FrameCutterTests(unittest.TestCase):
     def test_rejects_invalid_input_without_creating_an_export(self):
         corrupt = self.destination / "illisible.mp4"
         corrupt.write_bytes(b"not a video")
-        with self.assertRaises(FrameCutterError):
+        with self.assertRaisesRegex(FrameCutterError, "Impossible de lire cette vidéo"):
             probe_video(corrupt)
-        with self.assertRaises(FrameCutterError):
+        with self.assertRaisesRegex(FrameCutterError, "n’existe plus"):
             probe_video(self.destination / "absente.mp4")
-        with self.assertRaises(FrameCutterError):
-            self.extract(fps=0)
-        with self.assertRaises(FrameCutterError):
-            self.extract(image_format="GIF")
+        for fps in (0, 0.999, 60.001, -5, float("nan"), float("inf")):
+            with self.subTest(fps=fps), patch("frame_engine.subprocess.Popen") as popen:
+                with self.assertRaisesRegex(FrameCutterError, "cadence doit être comprise entre 1 et 60"):
+                    self.extract(fps=fps)
+                popen.assert_not_called()
+        with patch("frame_engine.subprocess.Popen") as popen:
+            with self.assertRaisesRegex(FrameCutterError, "Format de sortie non pris en charge"):
+                self.extract(image_format="GIF")
+            popen.assert_not_called()
         with self.assertRaisesRegex(FrameCutterError, "dossier de destination"):
             extract_frames(self.source, corrupt, 5, "JPEG", 2, lambda _: None, threading.Event())
         self.assertEqual(list(self.destination.iterdir()), [corrupt])
@@ -180,7 +187,7 @@ class FrameCutterTests(unittest.TestCase):
             probe_video(manifest)
         with self.assertRaisesRegex(FrameCutterError, "not on whitelist"):
             extract_frames(manifest, self.destination, 5, "JPEG", 2, lambda _: None, threading.Event())
-        with self.assertRaises(FrameCutterError):
+        with self.assertRaisesRegex(FrameCutterError, "Aucune image disponible"):
             read_preview_frame(manifest, 0, 160, 90, threading.Event())
 
     def test_cancellation_stops_a_silent_process(self):
@@ -472,19 +479,29 @@ class FrameCutterTests(unittest.TestCase):
         self.assertEqual(preview._portion_list.size(), 0)
 
     def test_cancelling_a_passage_batch_keeps_the_first_images(self):
+        # L’annulation est déclenchée à la fin du premier passage, avant le lancement du second :
+        # aucune dépendance à la vitesse de FFmpeg ni à la période de surveillance.
         cancel = threading.Event()
         updates = []
+        calls = []
+        real_extract_portion = frame_engine._extract_portion
 
-        def report(percent):
-            updates.append(percent)
-            if percent >= 50:
-                cancel.set()
+        def first_portion_then_cancel(*args, **kwargs):
+            calls.append(args[6:8])
+            result = real_extract_portion(*args, **kwargs)
+            cancel.set()
+            return result
 
-        with self.assertRaises(OperationCancelled) as stopped:
-            extract_frames(self.source, self.destination, 5, "PNG", 2, report, cancel,
+        with patch("frame_engine._extract_portion", side_effect=first_portion_then_cancel), \
+                self.assertRaisesRegex(OperationCancelled, "Extraction annulée") as stopped:
+            extract_frames(self.source, self.destination, 5, "PNG", 2, updates.append, cancel,
                            portions=((0, 1), (1, 2)))
-        self.assertEqual(len(list(stopped.exception.output_dir.glob("frame_*.png"))), 5)
-        self.assertEqual(max(updates), 50)
+        self.assertEqual(calls, [(0, 1), (1, 2)])
+        output_dir = stopped.exception.output_dir
+        self.assertEqual(sorted(p.name for p in output_dir.glob("frame_*.png")),
+                         [f"frame_{n:06d}.png" for n in range(1, 6)])
+        self.assertTrue(updates)
+        self.assertLessEqual(max(updates), 50)
 
     def test_link_import_only_accepts_single_supported_videos_over_https(self):
         link = parse_video_link("https://youtu.be/abcdefghijk?t=1&list=not-a-video", (60, 65))
@@ -493,16 +510,16 @@ class FrameCutterTests(unittest.TestCase):
         reel = parse_video_link("https://instagram.com/reel/abcdefghijk/?igsh=tracking")
         self.assertEqual(reel.platform, "instagram")
         self.assertEqual(reel.url, "https://www.instagram.com/reel/abcdefghijk/")
-        for url, bounds in (
-            ("file:///C:/video.mp4", None),
-            ("https://CANARY_TEST_USER:CANARY_TEST_PASS@example.test/video.mp4", None),
-            ("https://www.youtube.com/playlist?list=playlist", None),
-            ("https://www.instagram.com/p/abcdefghijk/", None),
-            ("https://www.instagram.com/reel/abcdefghijk/", (5, 8)),
-            ("https://example.invalid/video.mp4", (5, 8)),
+        for url, bounds, expected in (
+            ("file:///C:/video.mp4", None, "lien HTTPS valide"),
+            ("https://CANARY_TEST_USER:CANARY_TEST_PASS@example.test/video.mp4", None, "lien HTTPS valide"),
+            ("https://www.youtube.com/playlist?list=playlist", None, "vidéo YouTube individuelle"),
+            ("https://www.instagram.com/p/abcdefghijk/", None, "Reel Instagram public"),
+            ("https://www.instagram.com/reel/abcdefghijk/", (5, 8), "disponibles pour YouTube"),
+            ("https://example.invalid/video.mp4", (5, 8), "disponibles pour YouTube"),
         ):
             with self.subTest(url=url):
-                with self.assertRaises(FrameCutterError):
+                with self.assertRaisesRegex(FrameCutterError, expected):
                     parse_video_link(url, bounds)
 
     def test_output_suggestion_follows_the_video_but_keeps_the_chosen_folder(self):
@@ -947,9 +964,9 @@ class FrameCutterTests(unittest.TestCase):
     def test_available_output_dir_rejects_path_traversal_stems(self):
         sub = self.destination / "confined"
         sub.mkdir()
-        for bad_stem in ("..\\escaped", "../escaped", "nested/dir", "nested\\dir", "..", "."):
+        for bad_stem in ("..\\escaped", "../escaped", "nested/dir", "nested\\dir", "..", ".", "", "CANARY_TEST\x00nul"):
             with self.subTest(bad_stem=bad_stem):
-                with self.assertRaises(FrameCutterError):
+                with self.assertRaisesRegex(FrameCutterError, "Nom de dossier de résultat invalide"):
                     _available_output_dir(sub, bad_stem)
         self.assertEqual(list(sub.iterdir()), [])
         self.assertFalse((self.destination / "escaped_frames").exists())
@@ -957,7 +974,7 @@ class FrameCutterTests(unittest.TestCase):
     def test_failed_extraction_on_corrupt_video_cleans_empty_output_dir(self):
         corrupt = self.destination / "corrompue.mp4"
         corrupt.write_bytes(b"")
-        with self.assertRaises(FrameCutterError):
+        with self.assertRaisesRegex(FrameCutterError, "L’extraction a échoué"):
             extract_frames(corrupt, self.destination, 5, "JPEG", 2, lambda _: None, threading.Event())
         self.assertEqual(list(self.destination.iterdir()), [corrupt])
 
@@ -1013,86 +1030,78 @@ class ReleaseHardeningTests(unittest.TestCase):
         self.assertIn("https://ffmpeg.org/download.html", kept)
 
     def test_engine_errors_hide_system_paths_and_raw_ffmpeg_stderr(self):
-        canary_path = Path(self.CANARY_WIN)
-
-        class FakeFailProcess:
-            returncode = 1
-
-            def __init__(self, canary_win):
-                self._canary_win = canary_win
-                self.stdout = iter(())
-                self.stderr = iter((
-                    "[in#0 @ 00000123456789ab] Error opening input: Invalid data\n",
-                    f"Error opening input file {canary_win}.\n",
-                ))
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *_args):
-                return False
-
-            def communicate(self, timeout=None):
-                return (
-                    "",
-                    "[mov,mp4,m4a @ 00000123456789ab] moov atom not found\n"
-                    f"{self._canary_win}: Invalid data found when processing input\n",
-                )
-
-            def poll(self):
-                return 1
-
-            def wait(self):
-                return 1
-
+        # Découplé : vrais fichiers temporaires, aucun remplacement global de Path.
+        # Seul le processus FFmpeg est simulé, et chaque branche d’erreur reçoit un stderr
+        # qui contient le chemin réel et un chemin Windows fictif.
+        branches = (
+            ("No space left on device", "Espace disque insuffisant", "Espace disque insuffisant"),
+            ("Protocol 'http' not on whitelist 'file'!", "protocole externe non autorisé",
+             "protocole externe non autorisé"),
+            ("Format not on whitelist 'mov,matroska'", "format de fichier non pris en charge",
+             "format de fichier non pris en charge"),
+            ("Permission denied", "accès au fichier refusé", "accès au fichier ou au dossier refusé"),
+            ("moov atom not found", "Impossible de lire cette vidéo", "L’extraction a échoué. Vérifiez"),
+        )
         with tempfile.TemporaryDirectory() as temp:
-            temp_dir = Path(temp)
+            root = Path(temp)
+            (root / "CANARY_TEST_USER").mkdir()
+            source = root / "CANARY_TEST_USER" / "secret_clip.mp4"
+            source.write_bytes(b"CANARY_TEST")
+            destination = root / "CANARY_TEST_DIR"
+            destination.mkdir()
 
-            with patch("frame_engine.require_ffmpeg", return_value=("ffmpeg.exe", "ffprobe.exe")), \
-                    patch.object(Path, "is_file", return_value=True), \
-                    patch.object(Path, "resolve", return_value=canary_path):
-                with patch("frame_engine.subprocess.Popen", side_effect=OSError(errno.EACCES, "Permission denied", self.CANARY_WIN)):
-                    with self.assertRaises(FrameCutterError) as ctx:
-                        probe_video(canary_path)
-                    self.assert_no_system_leak(str(ctx.exception))
+            def fake_process(stderr_text):
+                class Process:
+                    returncode = 1
+                    stdout = iter(())
+                    stderr = iter(stderr_text.splitlines(keepends=True))
 
-                with patch("frame_engine._video_process", return_value=FakeFailProcess(self.CANARY_WIN)):
-                    with self.assertRaises(FrameCutterError) as ctx:
-                        probe_video(canary_path)
-                    self.assert_no_system_leak(str(ctx.exception))
+                    def communicate(self, timeout=None):
+                        return "", stderr_text
 
-                with patch("frame_engine.subprocess.Popen", side_effect=OSError(errno.EACCES, "Permission denied", self.CANARY_WIN)):
-                    with self.assertRaises(FrameCutterError) as ctx:
-                        read_preview_frame(canary_path, 0.0, 160, 90, threading.Event())
-                    self.assert_no_system_leak(str(ctx.exception))
+                    def wait(self):
+                        return 1
+
+                @contextmanager
+                def run(*_args, **_kwargs):
+                    yield Process()
+
+                return run
+
+            with patch("frame_engine.require_ffmpeg", return_value=("ffmpeg", "ffprobe")):
+                for token, probe_message, extract_message in branches:
+                    stderr_text = (
+                        f"[in#0 @ 00000123456789ab] Error opening input: {token}\n"
+                        f"Error opening input file {source}.\n"
+                        f"{self.CANARY_WIN}: {token}\n"
+                        f"{source}: {token}\n"
+                    )
+                    with self.subTest(branch=token), \
+                            patch("frame_engine._video_process", side_effect=fake_process(stderr_text)):
+                        with self.assertRaisesRegex(FrameCutterError, probe_message) as ctx:
+                            probe_video(source)
+                        self.assert_no_system_leak(str(ctx.exception))
+                        with self.assertRaisesRegex(FrameCutterError, extract_message) as ctx:
+                            extract_frames(source, destination, 5, "JPEG", 2.0, lambda _: None, threading.Event())
+                        self.assert_no_system_leak(str(ctx.exception))
+                        self.assertEqual(list(destination.iterdir()), [])
+
+                launch_failure = OSError(errno.EACCES, "Permission denied", self.CANARY_WIN)
+                for run, message in (
+                    (lambda: probe_video(source), "Impossible de lancer l’outil d’analyse"),
+                    (lambda: read_preview_frame(source, 1.0, 160, 90, threading.Event()), "Impossible de lancer l’aperçu"),
+                    (lambda: extract_frames(source, destination, 5, "JPEG", 2.0, lambda _: None, threading.Event()),
+                     "Impossible d’exécuter FFmpeg"),
+                ):
+                    with self.subTest(launch=message), patch("frame_engine.subprocess.Popen", side_effect=launch_failure):
+                        with self.assertRaisesRegex(FrameCutterError, message) as ctx:
+                            run()
+                        self.assert_no_system_leak(str(ctx.exception))
 
             with patch.object(Path, "mkdir", side_effect=PermissionError(errno.EACCES, "Permission denied", self.CANARY_WIN_E)):
-                with self.assertRaises(FrameCutterError) as ctx:
-                    _available_output_dir(temp_dir, "clip")
-                self.assert_no_system_leak(str(ctx.exception))
-
-            out_dir = temp_dir / "out"
-            out_dir.mkdir()
-            with patch("frame_engine.require_ffmpeg", return_value=("ffmpeg.exe", "ffprobe.exe")), \
-                    patch.object(Path, "is_file", return_value=True), \
-                    patch.object(Path, "is_dir", return_value=True), \
-                    patch.object(Path, "resolve", side_effect=[canary_path, temp_dir]), \
-                    patch("frame_engine._available_output_dir", return_value=out_dir):
-                with patch("frame_engine.subprocess.Popen", side_effect=OSError(errno.ENOENT, "No such file", self.CANARY_WIN)):
-                    with self.assertRaises(FrameCutterError) as ctx:
-                        extract_frames(canary_path, temp_dir, 5, "JPEG", 2.0, lambda _: None, threading.Event())
-                    self.assert_no_system_leak(str(ctx.exception))
-
-            out_dir.mkdir(exist_ok=True)
-            with patch("frame_engine.require_ffmpeg", return_value=("ffmpeg.exe", "ffprobe.exe")), \
-                    patch.object(Path, "is_file", return_value=True), \
-                    patch.object(Path, "is_dir", return_value=True), \
-                    patch.object(Path, "resolve", side_effect=[canary_path, temp_dir]), \
-                    patch("frame_engine._available_output_dir", return_value=out_dir), \
-                    patch("frame_engine._video_process", return_value=FakeFailProcess(self.CANARY_WIN)):
-                with self.assertRaises(FrameCutterError) as ctx:
-                    extract_frames(canary_path, temp_dir, 5, "JPEG", 2.0, lambda _: None, threading.Event())
-                self.assert_no_system_leak(str(ctx.exception))
+                with self.assertRaisesRegex(FrameCutterError, "Choisissez un dossier accessible") as ctx:
+                    _available_output_dir(destination, "clip")
+            self.assert_no_system_leak(str(ctx.exception))
 
     def test_app_error_messages_hide_system_paths_and_os_details(self):
         root = tk.Tk()
@@ -1183,6 +1192,10 @@ class ReleaseHardeningTests(unittest.TestCase):
         self.assertIn("yt-dlp", seen_packages)
         self.assertIn("yt-dlp-ejs", seen_packages)
 
+    @unittest.skipUnless(os.environ.get("FRAME_CUTTER_NETWORK_TESTS") == "1",
+                         "Test réseau (PyPI) : définir FRAME_CUTTER_NETWORK_TESTS=1 pour l’exécuter.")
+    def test_requirements_import_hashes_resolve_on_pypi(self):
+        req_file = Path(__file__).resolve().parents[1] / "requirements-import.txt"
         dry_run = subprocess.run(
             [
                 sys.executable, "-m", "pip", "install",

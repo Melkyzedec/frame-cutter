@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import errno
 import json
+import logging
 import math
 import os
 import re
-import shutil
 import subprocess
 import threading
+import traceback
 from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -18,6 +19,7 @@ from typing import Callable, Iterator, Sequence
 
 
 APP_DIR = Path(__file__).resolve().parent
+LOGGER = logging.getLogger("frame_cutter")
 FFMPEG_DIR = APP_DIR / "tools" / "ffmpeg" / "bin"
 _PREVIEW_DECODE_LOCK = threading.Lock()
 _FFMPEG_LOG_PREFIX_RE = re.compile(r"^\s*\[[^\]]+@\s*(?:0x)?[0-9a-fA-F]+\]")
@@ -32,18 +34,36 @@ _FILE_URI_RE = re.compile(r"""file://[^\s'"<>|\r\n]+""", re.IGNORECASE)
 _QUOTED_SYSTEM_PATH_RE = re.compile(
     r"""(['"])(?:(?<![A-Za-z0-9+.-])[A-Za-z]:(?!//)[\\/]|\\\\|/(?:Users|home|root|tmp|var|etc|opt|usr|mnt|media|Volumes|private)/)[^'"\r\n]+\1"""
 )
+# A path may contain spaces: it runs until a quote or guillemet, a ": " separator or the end of the line.
+_PATH_BODY = r"""[^\r\n'"<>|«»]*?(?=\s*[«»'"<>|]|\s+:\s|:\s|\s*$)"""
 _WIN_SYSTEM_PATH_RE = re.compile(
-    r"""(?<![A-Za-z0-9+.-])(?:[A-Za-z]:(?!//)[\\/]|\\\\)[^\s'"<>|\r\n]+(?: +[^\s:'"<>|\r\n]*[\\/][^\s'"<>|\r\n]+)*"""
+    r"""(?<![A-Za-z0-9+.-])(?:[A-Za-z]:(?!//)[\\/]|\\\\)""" + _PATH_BODY
 )
+_RELATIVE_PATH_RE = re.compile(r"""(?<![\w.~%\\/-])(?:\.{1,2}|~)[\\/]""" + _PATH_BODY)
+# A bare relative Windows path ("dossier\video.mp4", "%USERPROFILE%\..."). The application's own
+# "tools\..." folder, quoted in its help messages, is kept.
+_BACKSLASH_PATH_RE = re.compile(r"""(?<![\w.~%\\/-])(?!tools\\)[^\s'"<>|«»\\/:]+\\""" + _PATH_BODY)
 _UNIX_SYSTEM_PATH_RE = re.compile(
-    r"""(?<![:/A-Za-z0-9_.-])/(?:(?:Users|home|root|tmp|var|etc|opt|usr|mnt|media|Volumes|private)/[^\s'"<>|\r\n]+|(?:[A-Za-z0-9._-]+/)+[A-Za-z0-9._-]+)"""
+    r"""(?<![:/\w.~-])/(?:(?:Users|home|root|tmp|var|etc|opt|usr|mnt|media|Volumes|private)/|(?:[\w.-]+/)+[\w.-])"""
+    + _PATH_BODY
 )
+_UNIX_SINGLE_FILE_RE = re.compile(r"""(?<![:/\w.~-])/[\w-][\w.-]*\.[A-Za-z0-9]{1,8}\b""")
+# Containers FFmpeg may open: the video formats offered by the file dialog, and the exported images.
+# Playlists and indirections (hls, concat, tty, lavfi…) are refused because they can read other files.
+FORMAT_WHITELIST = "mov,matroska,webm,avi,mpeg,mpegts,asf,image2,png_pipe,jpeg_pipe"
 _FFMPEG_ERROR_TABLE = (
     (
         "no space left on device",
         {
             "probe": "Espace disque insuffisant pour analyser cette vidéo.",
             "extract": "Espace disque insuffisant. Libérez de la place ou choisissez un autre dossier.",
+        },
+    ),
+    (
+        "format not on whitelist",
+        {
+            "probe": "Impossible de lire cette vidéo : format de fichier non pris en charge (not on whitelist).",
+            "extract": "L’extraction a échoué : format de fichier non pris en charge (not on whitelist).",
         },
     ),
     (
@@ -79,11 +99,28 @@ def sanitize_user_error(message: str, fallback: str = "Une erreur technique est 
         cleaned = _FILE_URI_RE.sub("ce chemin", raw_line)
         cleaned = _QUOTED_SYSTEM_PATH_RE.sub("ce chemin", cleaned)
         cleaned = _WIN_SYSTEM_PATH_RE.sub("ce chemin", cleaned)
+        cleaned = _RELATIVE_PATH_RE.sub("ce chemin", cleaned)
+        cleaned = _BACKSLASH_PATH_RE.sub("ce chemin", cleaned)
         cleaned = _UNIX_SYSTEM_PATH_RE.sub("ce chemin", cleaned)
+        cleaned = _UNIX_SINGLE_FILE_RE.sub("ce chemin", cleaned)
         cleaned = re.sub(r"[ \t]{2,}", " ", cleaned).strip()
         if cleaned and re.search(r"[A-Za-z0-9À-ÿ]", cleaned):
             kept_lines.append(cleaned)
     return "\n".join(kept_lines) if kept_lines else fallback
+
+
+def describe_exception(exc: BaseException) -> str:
+    """Summarize an exception for the log without absolute paths or raw tracebacks."""
+    frames = traceback.extract_tb(exc.__traceback__)[-6:]
+    where = " > ".join(f"{Path(frame.filename).name}:{frame.name}:{frame.lineno}" for frame in frames)
+    detail = sanitize_user_error(str(exc), fallback="")
+    summary = type(exc).__name__ + (f": {detail}" if detail else "")
+    return f"{summary} [{where}]" if where else summary
+
+
+def log_unexpected_error(context: str, exc: BaseException) -> None:
+    """Record an unexpected failure. The user only sees a generic message."""
+    LOGGER.error("Erreur inattendue (%s) : %s", context, describe_exception(exc))
 
 
 def format_os_error(exc: OSError, fallback: str) -> str:
@@ -122,12 +159,29 @@ class VideoInfo:
     frame_rate: str | None
 
 
+def find_executable(name: str) -> str | None:
+    """Search the absolute PATH entries only, never the current directory.
+
+    shutil.which() also looks in the current directory on Windows and follows relative PATH
+    entries, so a planted ffmpeg.exe or node.exe could be run instead of the real one.
+    """
+    filename = f"{name}.exe" if os.name == "nt" and not name.lower().endswith(".exe") else name
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        entry = entry.strip().strip('"')
+        if not entry or not os.path.isabs(entry):
+            continue
+        candidate = Path(entry) / filename
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return None
+
+
 def _find_binary(name: str) -> str | None:
     suffix = ".exe" if os.name == "nt" else ""
     local = FFMPEG_DIR / f"{name}{suffix}"
     if local.is_file():
         return str(local)
-    return shutil.which(name) or shutil.which(f"{name}{suffix}")
+    return find_executable(name)
 
 
 def require_ffmpeg() -> tuple[str, str]:
@@ -194,7 +248,7 @@ def probe_video(path: Path, cancel_event: threading.Event | None = None) -> Vide
     command = [
         ffprobe,
         "-v", "error",
-        "-protocol_whitelist", "file",
+        "-protocol_whitelist", "file", "-format_whitelist", FORMAT_WHITELIST,
         "-show_entries", "format=duration:stream=codec_type,width,height,avg_frame_rate,r_frame_rate",
         "-of", "json",
         "-i", str(path),
@@ -254,7 +308,7 @@ def read_preview_frame(
     ffmpeg, _ = require_ffmpeg()
     command = [
         ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin",
-        "-protocol_whitelist", "file",
+        "-protocol_whitelist", "file", "-format_whitelist", FORMAT_WHITELIST,
     ]
     # An image file has no seekable timeline, even for a seek to zero.
     if seconds:
@@ -330,7 +384,8 @@ def validate_portions(duration: float, portions: Sequence[tuple[float, float]]) 
 
 
 def _available_output_dir(parent: Path, stem: str) -> Path:
-    if not stem or stem in {".", ".."} or "/" in stem or "\\" in stem or ".." in stem or "\x00" in stem:
+    # Separators are refused, so ".." can only be a whole name; "mon..clip" stays valid.
+    if not stem or stem in {".", ".."} or "/" in stem or "\\" in stem or "\x00" in stem:
         raise FrameCutterError("Nom de dossier de résultat invalide.")
     resolved_parent = parent.resolve()
     base = resolved_parent / f"{stem}_frames"
@@ -438,7 +493,7 @@ def _extract_portion(
     command = [
         ffmpeg,
         "-hide_banner", "-loglevel", "error", "-nostdin", "-nostats", "-progress", "pipe:1", "-n",
-        "-protocol_whitelist", "file",
+        "-protocol_whitelist", "file", "-format_whitelist", FORMAT_WHITELIST,
     ]
     if start:
         command += ["-ss", f"{start:.6f}"]
@@ -477,7 +532,10 @@ def _extract_portion(
                 current[key] = value
                 if key == "progress":
                     progress_seconds(min(portion_duration, _progress_seconds(current)))
-                    frame_count = int(current.get("frame", "0"))
+                    frame_value = current.get("frame", "")
+                    # FFmpeg may report "N/A" before the first frame: keep the last known count.
+                    if frame_value.isascii() and frame_value.isdecimal():
+                        frame_count = int(frame_value)
                     current.clear()
             return_code = process.wait()
             stderr_thread.join()
@@ -488,6 +546,9 @@ def _extract_portion(
         raise OperationCancelled("Extraction annulée. Les images déjà créées sont conservées.", output_dir)
     if return_code != 0:
         detail = "\n".join(stderr_lines).strip()
+        lowered = detail.lower()
+        if frame_count == 0 and "could not open encoder before eof" in lowered and "received no packets" in lowered:
+            raise FrameCutterError("Aucune image exportée. Ajustez la portion ou le rythme.", output_dir)
         raise FrameCutterError(_classify_ffmpeg_error(detail, context="extract"), output_dir)
     if frame_count == 0 or not (output_dir / f"frame_{first_frame + frame_count - 1:06d}.{extension}").is_file():
         raise FrameCutterError("Aucune image exportée. Ajustez la portion ou le rythme.", output_dir)

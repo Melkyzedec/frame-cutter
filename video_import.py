@@ -20,15 +20,19 @@ from importlib.util import find_spec
 from pathlib import Path
 from tempfile import gettempdir
 from urllib.error import HTTPError, URLError
-from urllib.parse import SplitResult, parse_qs, urlsplit
+from urllib.parse import SplitResult, parse_qs, quote, urlsplit
 from typing import BinaryIO
 from urllib.request import HTTPSHandler, HTTPRedirectHandler, ProxyHandler, build_opener
 from uuid import uuid4
 
-from frame_engine import APP_DIR, FrameCutterError, OperationCancelled, require_ffmpeg
+from frame_engine import APP_DIR, FrameCutterError, OperationCancelled, find_executable, require_ffmpeg
 
 
 IMPORT_TOOLS = APP_DIR / "tools" / "link-import"
+# Must match the yt-dlp pin of requirements-import.txt (checked by the tests).
+YT_DLP_VERSION = "2026.10.26"
+_YT_DLP_VERSION_RE = re.compile(r"""^__version__\s*=\s*['"]([^'"\r\n]*)['"]\s*$""", re.M)
+_SHOWN_VERSION_RE = re.compile(r"[0-9]{4}\.[0-9]{2}\.[0-9]{2}(?:\.[0-9A-Za-z]+)*")
 YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be", "www.youtu.be"}
 INSTAGRAM_HOSTS = {"instagram.com", "www.instagram.com"}
 IMPORT_TIMEOUT = 15 * 60
@@ -130,10 +134,34 @@ def _https_url(text: str) -> SplitResult:
     raise FrameCutterError("Collez un lien HTTPS valide, sans identifiant ni mot de passe.")
 
 
+def _literal_ip(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """Return the address written in the link, including legacy IPv4 forms (127.1, 0x7f.0.0.1, 2130706433)."""
+    candidate = host.split("%", 1)[0]
+    try:
+        return ipaddress.ip_address(candidate)
+    except ValueError:
+        pass
+    if not re.fullmatch(r"(?:0[xX][0-9a-fA-F]+|[0-9]+)(?:\.(?:0[xX][0-9a-fA-F]+|[0-9]+)){0,3}", candidate):
+        return None
+    try:
+        return ipaddress.IPv4Address(socket.inet_aton(candidate))
+    except OSError:
+        return None
+
+
+def _is_public_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return ip.is_global and not ip.is_multicast and not ip.is_reserved and not getattr(ip, "is_site_local", False)
+
+
 def parse_video_link(text: str, portion: tuple[float, float] | None = None) -> VideoLink:
     text = text.strip()
     url = _https_url(text)
     host = (url.hostname or "").rstrip(".")
+    literal = _literal_ip(host)
+    if literal is not None and not _is_public_ip(literal):
+        raise FrameCutterError("Ce lien ne mène pas à un serveur public. Ouvrez la vidéo comme fichier local.")
     if portion is not None and not 0 <= portion[0] < portion[1] < math.inf:
         raise FrameCutterError("La fin doit être après le début.")
     if host not in YOUTUBE_HOSTS:
@@ -146,7 +174,12 @@ def parse_video_link(text: str, portion: tuple[float, float] | None = None) -> V
                 raise FrameCutterError("Collez le lien d’un Reel Instagram public, au format /reel/…")
             reel_id = reel.group(1)
             return VideoLink(f"https://www.instagram.com/reel/{reel_id}/", "instagram", reel_id)
-        return VideoLink(url._replace(fragment="").geturl())
+        # Percent-encode non-ASCII characters; existing escapes (%XX) are kept as they are.
+        return VideoLink(url._replace(
+            path=quote(url.path, safe="/%:@!$&'()*+,;=~"),
+            query=quote(url.query, safe="=&%/:?@!$'()*+,;~"),
+            fragment="",
+        ).geturl())
 
     path = url.path.strip("/").split("/")
     video_id = ""
@@ -175,10 +208,7 @@ def _connect_public(address: tuple[str, int], timeout: float | None = None,
     deadline = time.monotonic() + (NETWORK_TIMEOUT if timeout is None else timeout)
     last_error = None
     for family, socktype, protocol, _, destination in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM):
-        ip = ipaddress.ip_address(destination[0].split("%", 1)[0])
-        if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
-            ip = ip.ipv4_mapped
-        if not ip.is_global or ip.is_multicast or ip.is_reserved:
+        if not _is_public_ip(ipaddress.ip_address(destination[0].split("%", 1)[0])):
             continue
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -291,6 +321,37 @@ def _stop_download(process: subprocess.Popen) -> None:
     if process.poll() is None:
         process.kill()
 
+def _source_yt_dlp_version(package_dir: Path | None) -> str | None:
+    """Read yt_dlp/version.py as text: nothing from the package is imported or run."""
+    if package_dir is None:
+        return None
+    try:
+        text = (package_dir / "version.py").read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return None
+    match = _YT_DLP_VERSION_RE.search(text)
+    return match.group(1) if match else None
+
+
+def _frozen_yt_dlp_version(downloader: Path) -> str | None:
+    try:
+        completed = subprocess.run(
+            [str(downloader), "--version"], stdin=subprocess.DEVNULL, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=15, creationflags=NO_WINDOW, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return completed.stdout.strip() if completed.returncode == 0 else None
+
+
+def _require_pinned_yt_dlp(found: str | None) -> None:
+    if found == YT_DLP_VERSION:
+        return
+    shown = found if found and _SHOWN_VERSION_RE.fullmatch(found) else "inconnue"
+    raise FrameCutterError(f"Le composant d’import yt-dlp est en version {shown}, alors que la version attendue "
+                           f"({YT_DLP_VERSION}) est requise. Réinstallez les composants d’import indiqués dans le README.")
+
+
 def _download_platform(
     link: VideoLink, folder: Path, cancel: threading.Event, deadline: float, *, preserve_audio: bool = False,
 ) -> Path:
@@ -303,15 +364,22 @@ def _download_platform(
         downloader = IMPORT_TOOLS / "yt-dlp.exe"
         if not downloader.is_file():
             raise FrameCutterError("Le composant d’import est absent. Réextrayez l’archive de Frame Cutter.")
+        _require_pinned_yt_dlp(_frozen_yt_dlp_version(downloader))
         command = [str(downloader)]
     else:
         modules = ("yt_dlp", "yt_dlp_ejs") if youtube else ("yt_dlp",)
         if all((IMPORT_TOOLS / name / "__init__.py").is_file() for name in modules):
             env["PYTHONPATH"] = str(IMPORT_TOOLS)
+            package_dir = IMPORT_TOOLS / "yt_dlp"
         elif not all(find_spec(name) is not None for name in modules):
             raise FrameCutterError(f"Le composant d’import {platform_name} est absent. "
                                    "Installez les dépendances indiquées dans le README.")
-        command = [sys.executable, "-B", "-m", "yt_dlp"]
+        else:
+            locations = list(getattr(find_spec("yt_dlp"), "submodule_search_locations", None) or [])
+            package_dir = Path(locations[0]) if locations else None
+        _require_pinned_yt_dlp(_source_yt_dlp_version(package_dir))
+        # -P: the import folder used as cwd must not be added to sys.path.
+        command = [sys.executable, "-B", "-P", "-m", "yt_dlp"]
     ffmpeg, _ = require_ffmpeg()
     name = f"{link.platform}-{link.video_id}" + ("-extrait" if link.portion else "")
     path = folder / f"{name}.mp4"
@@ -328,7 +396,7 @@ def _download_platform(
         command += ["--merge-output-format", "mkv", "--remux-video", "mkv"]
     if youtube:
         bundled_node = IMPORT_TOOLS / "node.exe"
-        node = str(bundled_node) if bundled_node.is_file() else shutil.which("node")
+        node = str(bundled_node) if bundled_node.is_file() else find_executable("node")
         if node is None:
             raise FrameCutterError("L’import YouTube nécessite Node.js 22 ou plus récent dans le PATH.")
         match_filter = "!is_live & !is_upcoming"
@@ -388,6 +456,10 @@ def download_video(
     except HTTPError as exc:
         _check_interrupt(cancel, deadline)
         raise FrameCutterError(f"Le serveur refuse l’accès à la vidéo (HTTP {exc.code}).") from None
+    except UnicodeError:
+        _check_interrupt(cancel, deadline)
+        raise FrameCutterError("L’adresse du lien contient des caractères non pris en charge. "
+                               "Vérifiez le lien ou ouvrez la vidéo comme fichier local.") from None
     except (URLError, TimeoutError):
         _check_interrupt(cancel, deadline)
         raise FrameCutterError("Le serveur vidéo est injoignable ou le téléchargement a expiré.") from None
